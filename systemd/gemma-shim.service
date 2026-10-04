@@ -1,0 +1,13 @@
+[Unit]
+Description=Gemma 4 31B OpenAI-compatible key-rotating shim (127.0.0.1:8810)
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /home/ubuntu/repos/snowball/gemma_shim/shim.py
+Restart=on-failure
+RestartSec=10
+MemoryMax=300M
+MemorySwapMax=0
+
+[Install]
+WantedBy=default.target

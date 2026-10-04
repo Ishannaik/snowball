@@ -1,0 +1,9 @@
+[Unit]
+Description=Research wiki digest at 08:00 IST daily
+
+[Timer]
+OnCalendar=*-*-* 08:00:00 Asia/Kolkata
+Persistent=false
+
+[Install]
+WantedBy=timers.target

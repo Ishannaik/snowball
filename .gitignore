@@ -1,0 +1,17 @@
+.env
+logs/
+state/
+*.lock
+node_modules/
+run.sh.new
+collected/
+STOP
+__pycache__/
+wiki/
+raw/
+sources/
+digests/
+log.md
+data/
+*.db
+topics.yml

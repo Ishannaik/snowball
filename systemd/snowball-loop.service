@@ -1,0 +1,18 @@
+[Unit]
+Description=Research wiki non-stop loop (one topic per iteration, 5 min pause; touch STOP to pause)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ubuntu/repos/snowball
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/home/ubuntu/.local/bin
+ExecStart=/home/ubuntu/repos/snowball/loop.sh
+Restart=always
+RestartSec=60
+MemoryMax=3G
+MemorySwapMax=0
+Nice=10
+KillMode=control-group
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,8 @@
+[Unit]
+Description=Research wiki daily Discord digest (last 24 h)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/ubuntu/repos/snowball
+ExecStart=/usr/bin/python3 /home/ubuntu/repos/snowball/tools/digest.py --daily
+MemoryMax=200M

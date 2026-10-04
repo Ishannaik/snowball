@@ -5,7 +5,6 @@ Research that never repeats itself.
 Snowball is a research agent that runs non-stop. You give it a few seed topics. It follows what it finds, layer after layer, and builds its own library. It never re-reads a page it has already read, and it never re-researches a fact or topic it already knows. Once a day it posts a digest of only what is new.
 
 The status today is **v0, a fork of the research-wiki loop**. It already runs unattended on our own models, through an OpenAI-compatible proxy. It searches with an Exa key pool, reads Reddit through Arctic Shift, keeps a markdown wiki, guards against prompt injection, and posts a Discord digest. The crawler described in [docs/DESIGN.md](docs/DESIGN.md) is the next build.
-| `docs/PLAN.md` | Full feature list (P0-P2 with tests), architecture, data model, milestones. |
 
 ## Layout
 

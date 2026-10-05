@@ -171,3 +171,18 @@ Total is about 40 h of agent time over roughly a week. Each milestone ships and 
 - **Arctic Shift** timeouts on busy subreddits. Backoff exists; there is no fallback by design (no IP-burning scraping).
 - **Exa pool exhaustion.** Library-first search (F2) is the main saver.
 - **grok `-p` hangs** after it answers. It must be killed after output.
+
+
+
+## 8. Competitor Hardening & Battle-Tested Mitigations
+Synthesized from forensic audits of 8 open-source agents (see [COMPETITOR_DEEP_DIVE.md](COMPETITOR_DEEP_DIVE.md)):
+1. **SSRF Guard (`safe_url_fetcher`):** Pin resolved DNS IPs before HTTP connection; reject RFC 1918 / loopback / cloud metadata (`169.254.169.254`).
+2. **Reddit Shreddit Endpoints:** Query `/svc/shreddit/search/` server components instead of deprecated `.rss` endpoints.
+3. **Snowflake Post Validation:** Extract millisecond timestamps `(id >> 22) + 1288834974657` from X URLs to reject hallucinated posts.
+4. **Pure-Python BM25 Filter:** Adopt GPTR PR #2161/2162 pattern to bypass heavy PyTorch/FAISS dependencies on ARM.
+5. **SQLite `BEGIN IMMEDIATE` Locking:** Enforce write serialization in WAL mode to eliminate multi-worker mutex deadlocks.
+6. **TokenBudgetMiddleware Tool Stripping:** Strip tool calling capability when budget reaches 100%, forcing synthesis and graceful exit (DeerFlow).
+7. **Attempt-Refunding Outage Handling:** Treat HTTP 429 and transient gateway 503s as pauses rather than incrementing task failure strikes (Research-Queue).
+8. **Page Merge 70% Length Floor:** Enforce `BODY_SHRINK_THRESHOLD = 0.70` and deterministic YAML array unions (`sources`, `tags`, `aliases`) to prevent compaction loss (Nashsu `page-merge.ts`).
+9. **Sibling-Section Fencing:** Inject sibling subagent assignment titles into prompts to prevent duplicate research sections (GPTR PR #2158).
+10. **Bounded Staleness Propagation:** Limit wiki graph dirty propagation to depth D <= 1 to avoid cascading recompilation storms (LucasAstorian).

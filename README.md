@@ -4,7 +4,7 @@ Research that never repeats itself.
 
 Snowball is a research agent that runs non-stop. You give it a few seed topics. It follows what it finds, layer after layer, and builds its own library. It never re-reads a page it has already read, and it never re-researches a fact or topic it already knows. Once a day it posts a digest of only what is new.
 
-The status today is **v0, a fork of the research-wiki loop**. It already runs unattended on our own models, through an OpenAI-compatible proxy. It searches with an Exa key pool, reads Reddit through Arctic Shift, keeps a markdown wiki, guards against prompt injection, and posts a Discord digest. The crawler described in [docs/DESIGN.md](docs/DESIGN.md) is the next build.
+The status today is **v0, a fork of the research-wiki loop**. It already runs unattended on our own models, through an OpenAI-compatible proxy. It searches with an Exa key pool, reads Reddit through Arctic Shift, keeps a markdown wiki, guards against prompt injection, and posts a Discord digest. The crawler specified in [docs/SYSTEM_DESIGN.md](docs/SYSTEM_DESIGN.md) is the next build.
 
 ## Layout
 
@@ -19,7 +19,8 @@ The status today is **v0, a fork of the research-wiki loop**. It already runs un
 | `tools/digest.py` | Daily Discord digest. The channel is set in `config.env`. |
 | `prompts/research.md`, `SOUL.md` | Model instructions. |
 | `systemd/` | User units: `snowball-loop.service`, `snowball-digest.{service,timer}`. |
-| `docs/DESIGN.md` | Crawl decision tree, no-repeat locks and roadmap. |
+| `docs/SYSTEM_DESIGN.md` | **The definitive spec**: invariants, architecture, 5-layer lock engine, scraper waterfall, full SQLite schema, orchestration, safety pipeline, wiki compiler, M0-M4 gates, failure-mode matrix. |
+| `docs/DESIGN.md` | v0 crawl decision tree and locks (history; superseded by SYSTEM_DESIGN.md). |
 | `docs/PLAN.md` | Full feature list (P0-P2 with tests), architecture, data model, milestones. |
 | `docs/FEATURE_MATRIX.md` | Code-read comparison of 8 open-source research agents, plus what we port from each. |
 

@@ -209,6 +209,8 @@ def load_config() -> Config:
     c.grok_reasoning_effort = env.get("GROK_REASONING_EFFORT", c.grok_reasoning_effort)
     c.grok_verify_timeout_sec = gi("GROK_VERIFY_TIMEOUT_SEC", c.grok_verify_timeout_sec)
     c.grok_x_bin = env.get("GROK_X_BIN", c.grok_x_bin)
+    if not Path(c.grok_x_bin).exists():
+        c.grok_x_bin = shutil.which("grok") or c.grok_x_bin
     c.grok_x_model = env.get("GROK_X_MODEL", c.grok_x_model)
     c.grok_x_poll_sec = gi("GROK_X_POLL_SEC", c.grok_x_poll_sec)
     c.grok_x_window_days = gi("GROK_X_WINDOW_DAYS", c.grok_x_window_days)

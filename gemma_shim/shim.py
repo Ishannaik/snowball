@@ -114,8 +114,12 @@ async def as_sse(req: web.Request, data: dict) -> web.StreamResponse:
     """Re-emit a whole chat.completion as an OpenAI chat.completion.chunk stream."""
     resp = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
     await resp.prepare(req)
-    base = {"id": data.get("id", "gemma"), "object": "chat.completion.chunk",
-            "created": data.get("created", int(time.time())), "model": MODEL}
+    base = {
+        "id": data.get("id", "gemma"),
+        "object": "chat.completion.chunk",
+        "created": data.get("created", int(time.time())),
+        "model": MODEL,
+    }
     for ch in data.get("choices", []):
         msg = ch.get("message") or {}
         delta = {"role": "assistant"}
@@ -251,7 +255,9 @@ def main() -> None:
     app.router.add_get("/health", health)
     app.on_startup.append(on_start)
     app.on_cleanup.append(on_stop)
-    log.info("gemma-shim on 127.0.0.1:%d, %d keys, %d rpm/key, daily cap %d", PORT, len(app["keys"]), PER_KEY_RPM, DAILY_CAP)
+    log.info(
+        "gemma-shim on 127.0.0.1:%d, %d keys, %d rpm/key, daily cap %d", PORT, len(app["keys"]), PER_KEY_RPM, DAILY_CAP
+    )
     web.run_app(app, host="127.0.0.1", port=PORT, print=None, access_log=None)
 
 

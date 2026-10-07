@@ -10,7 +10,7 @@ while true; do
   if [[ -e "$ROOT/STOP" ]]; then
     echo "$(date '+%F %T') STOP file present, paused"; sleep 60; continue
   fi
-  "$ROOT/run.sh" --max-topics 1
+  python3 "$ROOT/snowball.py" run --max-topics 1
   rc=$?
   # Nothing to run, or the daily cap is reached: wait longer before asking again.
   if tail -3 "$(ls -t "$ROOT"/logs/run-*.log 2>/dev/null | head -1)" 2>/dev/null | grep -qE "nothing to run|daily cap"; then

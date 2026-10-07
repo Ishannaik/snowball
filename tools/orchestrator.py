@@ -45,6 +45,7 @@ if (
 
 import argparse
 import contextlib
+
 try:
     import fcntl
 except ImportError:
@@ -75,25 +76,29 @@ from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from typing import Any
 
+
 def _flock_ex(fh: Any) -> None:
     if fcntl is not None:
         fcntl.flock(fh, fcntl.LOCK_EX)
     else:
         import msvcrt
-        try:
+
+        with contextlib.suppress(Exception):
             msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
-        except Exception:
-            pass
+
 
 def _flock_nb(fh: Any) -> None:
     if fcntl is not None:
         fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
     else:
         import msvcrt
+
         try:
             msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
         except OSError as e:
-            raise BlockingIOError('locked') from e
+            raise BlockingIOError("locked") from e
+
+
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 ROOT = Path(__file__).resolve().parent.parent

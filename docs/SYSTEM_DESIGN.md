@@ -199,14 +199,17 @@ The engine runs **before** any LLM call on the way in (page, query) and **before
 ```python
 import hashlib, re, unicodedata
 
+
 def norm_query(q: str) -> str:
     q = unicodedata.normalize("NFKC", q).casefold()
-    q = re.sub(r"[^\w\s\-]", " ", q)          # keep word chars, spaces, hyphens
-    toks = sorted(set(q.split()))             # order-free: "grants india" == "india grants"
+    q = re.sub(r"[^\w\s\-]", " ", q)  # keep word chars, spaces, hyphens
+    toks = sorted(set(q.split()))  # order-free: "grants india" == "india grants"
     return " ".join(toks)
+
 
 def window_key(family_recheck_days: int, now: int) -> int:
     return now // (family_recheck_days * 86400)
+
 
 def query_key(raw: str, source: str, recheck_days: int, now: int) -> str:
     return hashlib.sha1(f"{norm_query(raw)}|{source}|{window_key(recheck_days, now)}".encode()).hexdigest()
@@ -231,11 +234,33 @@ Three keys, checked in order.
 ```python
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
-TRACKING_EXACT = {"fbclid","gclid","dclid","msclkid","yclid","mc_cid","mc_eid","igshid","si",
-                  "ref","ref_src","source","spm","trk","_hsenc","_hsmi","oly_enc_id","oly_anon_id",
-                  "vero_id","wickedid","feature","utm"}
+TRACKING_EXACT = {
+    "fbclid",
+    "gclid",
+    "dclid",
+    "msclkid",
+    "yclid",
+    "mc_cid",
+    "mc_eid",
+    "igshid",
+    "si",
+    "ref",
+    "ref_src",
+    "source",
+    "spm",
+    "trk",
+    "_hsenc",
+    "_hsmi",
+    "oly_enc_id",
+    "oly_anon_id",
+    "vero_id",
+    "wickedid",
+    "feature",
+    "utm",
+}
 HOST_PREFIXES = ("www.", "m.", "mobile.", "old.", "amp.", "new.")
 INDEX_FILES = ("/index.html", "/index.htm", "/index.php", "/default.aspx")
+
 
 def canonical_url(raw: str) -> str | None:
     u = urlsplit(raw.strip())
@@ -244,7 +269,7 @@ def canonical_url(raw: str) -> str | None:
     host = u.hostname.encode("idna").decode().lower().rstrip(".")
     for p in HOST_PREFIXES:
         if host.startswith(p) and host.count(".") >= 2:
-            host = host[len(p):]
+            host = host[len(p) :]
             break
     path = re.sub(r"/{2,}", "/", u.path or "/")
     for f in INDEX_FILES:
@@ -252,10 +277,13 @@ def canonical_url(raw: str) -> str | None:
             path = path[: -len(f)] or "/"
     if len(path) > 1:
         path = path.rstrip("/")
-    q = [(k, v) for k, v in parse_qsl(u.query, keep_blank_values=False)
-         if not k.lower().startswith("utm_") and k.lower() not in TRACKING_EXACT]
+    q = [
+        (k, v)
+        for k, v in parse_qsl(u.query, keep_blank_values=False)
+        if not k.lower().startswith("utm_") and k.lower() not in TRACKING_EXACT
+    ]
     q.sort()
-    return urlunsplit(("https", host, path, urlencode(q), ""))   # scheme and fragment collapse
+    return urlunsplit(("https", host, path, urlencode(q), ""))  # scheme and fragment collapse
 ```
 
 Edge rules:
@@ -268,9 +296,9 @@ Edge rules:
 ```python
 def norm_text(s: str) -> str:
     s = unicodedata.normalize("NFKC", s)
-    s = s.translate(str.maketrans({"‘":"'", "’":"'", "“":'"', "”":'"',
-                                   "–":"-", "—":"-", " ":" "}))
+    s = s.translate(str.maketrans({"‘": "'", "’": "'", "“": '"', "”": '"', "–": "-", "—": "-", " ": " "}))
     return re.sub(r"\s+", " ", s).strip()
+
 
 def content_hash(main_text: str) -> str:
     return hashlib.sha256(norm_text(main_text).casefold()[:200_000].encode()).hexdigest()
@@ -282,13 +310,17 @@ def content_hash(main_text: str) -> str:
 
 ```python
 P = (1 << 61) - 1
-SEEDS = [(a, b) for a, b in zip(range(1, 129), range(1000, 1128))]   # fixed, 128 permutations
+SEEDS = [(a, b) for a, b in zip(range(1, 129), range(1000, 1128))]  # fixed, 128 permutations
 BANDS, ROWS = 16, 8
+
 
 def shingles(text: str, k: int = 3) -> set[int]:
     toks = norm_text(text).casefold().split()
-    return {int.from_bytes(hashlib.blake2b(" ".join(toks[i:i+k]).encode(), digest_size=8).digest(), "big")
-            for i in range(max(0, len(toks) - k + 1))}
+    return {
+        int.from_bytes(hashlib.blake2b(" ".join(toks[i : i + k]).encode(), digest_size=8).digest(), "big")
+        for i in range(max(0, len(toks) - k + 1))
+    }
+
 
 def minhash(text: str) -> list[int]:
     sh = shingles(text)
@@ -296,8 +328,12 @@ def minhash(text: str) -> list[int]:
         return [0] * 128
     return [min(((a * s + b) % P) & 0xFFFFFFFF for s in sh) for a, b in SEEDS]
 
+
 def band_keys(sig: list[int]) -> list[tuple[int, str]]:
-    return [(b, hashlib.sha1(bytes(str(sig[b*ROWS:(b+1)*ROWS]), "ascii")).hexdigest()[:16]) for b in range(BANDS)]
+    return [
+        (b, hashlib.sha1(bytes(str(sig[b * ROWS : (b + 1) * ROWS]), "ascii")).hexdigest()[:16]) for b in range(BANDS)
+    ]
+
 
 def est_jaccard(a: list[int], b: list[int]) -> float:
     return sum(x == y for x, y in zip(a, b)) / 128
@@ -320,9 +356,27 @@ Candidates come from `minhash_bands` (any shared band bucket). A candidate with 
 **Key:** `entity_key = slug(norm_name) + "|" + (slug(norm_org) or "-") + "|" + (year or "-")`
 
 ```python
-LEGAL_SUFFIX = {"inc","inc.","llc","ltd","ltd.","limited","corp","corp.","corporation","co","co.","gmbh","pvt","plc","sa","ag"}
-NAME_STOP = {"the","a","an","of","for","and","&"}
+LEGAL_SUFFIX = {
+    "inc",
+    "inc.",
+    "llc",
+    "ltd",
+    "ltd.",
+    "limited",
+    "corp",
+    "corp.",
+    "corporation",
+    "co",
+    "co.",
+    "gmbh",
+    "pvt",
+    "plc",
+    "sa",
+    "ag",
+}
+NAME_STOP = {"the", "a", "an", "of", "for", "and", "&"}
 YEAR_RX = re.compile(r"\b(20[2-3]\d)\b")
+
 
 def norm_name(s: str) -> tuple[str, str | None]:
     s = unicodedata.normalize("NFKC", s).casefold()
@@ -331,9 +385,11 @@ def norm_name(s: str) -> tuple[str, str | None]:
     toks = [t for t in re.sub(r"[^\w\s]", " ", s).split() if t not in NAME_STOP and t not in LEGAL_SUFFIX]
     return " ".join(toks), (year.group(1) if year else None)
 
+
 def slug(s: str) -> str:
     s = re.sub(r"[^a-z0-9]+", "-", s.casefold()).strip("-")
-    return s[:80].rstrip("-")          # fixed point: slug(slug(x)) == slug(x), tested in M1
+    return s[:80].rstrip("-")  # fixed point: slug(slug(x)) == slug(x), tested in M1
+
 
 def entity_key(name: str, org: str | None, deadline_iso: str | None) -> str:
     n, y_in_name = norm_name(name)
@@ -354,6 +410,7 @@ Year comes from the deadline when there is one, so a yearly program ("X Fellowsh
 ```python
 MATERIAL = ("deadline", "amount", "currency", "status", "eligibility", "link", "location")
 
+
 def diff(old: dict, new: dict) -> list[tuple[str, str, str]]:
     out = []
     for f in MATERIAL:
@@ -364,7 +421,7 @@ def diff(old: dict, new: dict) -> list[tuple[str, str, str]]:
             changed = canonical_url(a or "") != canonical_url(b or "")
         else:
             changed = (a or None) != (b or None)
-        if changed and b is not None:            # a disappearance is not a change; a page can omit a field
+        if changed and b is not None:  # a disappearance is not a change; a page can omit a field
             out.append((f, str(a), str(b)))
     return out
 ```
@@ -389,13 +446,16 @@ A claim is one declarative sentence with a source quote. Port of `last30days/lib
 ```python
 def char_trigrams(s: str) -> set[str]:
     s = re.sub(r"\s+", " ", norm_text(s).casefold())
-    return {s[i:i+3] for i in range(len(s) - 2)}
+    return {s[i : i + 3] for i in range(len(s) - 2)}
+
 
 def tokens(s: str) -> set[str]:
     return set(re.sub(r"[^\w\s]", " ", norm_text(s).casefold()).split())
 
+
 def jaccard(a: set, b: set) -> float:
     return len(a & b) / len(a | b) if (a | b) else 0.0
+
 
 def hybrid_similarity(a: str, b: str) -> float:
     return 0.5 * jaccard(char_trigrams(a), char_trigrams(b)) + 0.5 * jaccard(tokens(a), tokens(b))
@@ -425,23 +485,28 @@ Calibration (2026-10-06, 8 labelled pairs against the 10-topic seed corpus, four
 import math
 from collections import Counter
 
+
 def stem(t: str) -> str:
     for suf in ("ings", "ing", "es", "s"):
         if t.endswith(suf) and len(t) - len(suf) >= 4:
-            return t[:-len(suf)]
+            return t[: -len(suf)]
     return t
 
+
 def topic_terms(title: str, focus: str) -> Counter:
-    toks = [stem(t) for t in re.sub(r"[^\w\s]", " ", norm_text(f"{title} {focus}").casefold()).split()
-            if t not in NAME_STOP]
-    return Counter(toks)                                   # unigrams only: bigrams measured worse
+    toks = [
+        stem(t) for t in re.sub(r"[^\w\s]", " ", norm_text(f"{title} {focus}").casefold()).split() if t not in NAME_STOP
+    ]
+    return Counter(toks)  # unigrams only: bigrams measured worse
+
 
 def tfidf_cosine(a: Counter, b: Counter, df: dict[str, int], n_docs: int) -> float:
     def w(c: Counter) -> dict[str, float]:
         return {t: (1 + math.log(f)) * math.log((n_docs + 1) / (df.get(t, 0) + 1)) for t, f in c.items()}
+
     wa, wb = w(a), w(b)
     dot = sum(wa[t] * wb[t] for t in wa.keys() & wb.keys())
-    na, nb = math.sqrt(sum(v*v for v in wa.values())), math.sqrt(sum(v*v for v in wb.values()))
+    na, nb = math.sqrt(sum(v * v for v in wa.values())), math.sqrt(sum(v * v for v in wb.values()))
     return dot / (na * nb) if na and nb else 0.0
 ```
 
@@ -505,15 +570,17 @@ Before any HTTP request the router picks the cheapest known-good route by host p
 ```python
 from curl_cffi import requests as cffi, CurlOpt
 
-IMPERSONATE = "chrome"            # resolves to the newest profile in the installed curl_cffi (chrome146 on 0.15.0)
+IMPERSONATE = "chrome"  # resolves to the newest profile in the installed curl_cffi (chrome146 on 0.15.0)
 UA_SUFFIX = " SnowballBot/1.0 (+https://github.com/Ishannaik/snowball; research crawler)"
+
 
 def fetch_direct(raw_url: str, pinned_ip: str, host: str, port: int) -> cffi.Response:
     s = cffi.Session(impersonate=IMPERSONATE)
-    s.curl.setopt(CurlOpt.RESOLVE, [f"{host}:{port}:{pinned_ip}"])       # DNS pinning (7.1)
+    s.curl.setopt(CurlOpt.RESOLVE, [f"{host}:{port}:{pinned_ip}"])  # DNS pinning (7.1)
     s.curl.setopt(CurlOpt.MAXFILESIZE_LARGE, 5 * 1024 * 1024)
-    return s.get(raw_url, allow_redirects=False, timeout=(10, 30),
-                 headers={"Accept-Language": "en-US,en;q=0.9"}, stream=True)
+    return s.get(
+        raw_url, allow_redirects=False, timeout=(10, 30), headers={"Accept-Language": "en-US,en;q=0.9"}, stream=True
+    )
 ```
 
 - `impersonate="chrome"` gives a Chrome TLS, JA4 and HTTP/2 fingerprint for about 30 MB RSS per process, which is the entire anti-ban budget at tier 1.
@@ -529,18 +596,29 @@ WALL_STATUS = {401, 403, 407, 451}
 CHALLENGE_RX = re.compile(
     r"(cf-chl|__cf_chl_|challenge-platform|Just a moment\.\.\.|Attention Required!|cf-turnstile|"
     r"Please verify you are a human|hcaptcha\.com|recaptcha/api|g-recaptcha|px-captcha|perimeterx|"
-    r"datadome|Access Denied.{0,40}akamai|Checking your browser|enable JavaScript and cookies to continue)", re.I)
+    r"datadome|Access Denied.{0,40}akamai|Checking your browser|enable JavaScript and cookies to continue)",
+    re.I,
+)
 LOGIN_RX = re.compile(r'<input[^>]+type="password"', re.I)
 
+
 def classify_response(status: int, body: str, final_url: str) -> str:
-    if status in WALL_STATUS:                      return "walled"
-    if status == 200 and len(body) < 4000 and CHALLENGE_RX.search(body): return "walled"   # challenge disguised as 200
-    if status == 200 and CHALLENGE_RX.search(body[:20000]): return "walled"
-    if status == 200 and LOGIN_RX.search(body) and len(norm_text(strip_tags(body))) < 600: return "walled"
-    if status in (429, 500, 502, 503, 504):        return "outage"
-    if status in (404, 410):                       return "failure"
-    if status >= 400:                              return "failure"
-    if len(norm_text(strip_tags(body))) < 200:     return "failure"       # empty DOM
+    if status in WALL_STATUS:
+        return "walled"
+    if status == 200 and len(body) < 4000 and CHALLENGE_RX.search(body):
+        return "walled"  # challenge disguised as 200
+    if status == 200 and CHALLENGE_RX.search(body[:20000]):
+        return "walled"
+    if status == 200 and LOGIN_RX.search(body) and len(norm_text(strip_tags(body))) < 600:
+        return "walled"
+    if status in (429, 500, 502, 503, 504):
+        return "outage"
+    if status in (404, 410):
+        return "failure"
+    if status >= 400:
+        return "failure"
+    if len(norm_text(strip_tags(body))) < 200:
+        return "failure"  # empty DOM
     return "ok"
 ```
 
@@ -556,12 +634,13 @@ Disabled unless the operator sets `ZENROWS_API_KEY` or `RESIDENTIAL_PROXY_URL` i
 def paid_fetch_allowed(page, domain, budget) -> bool:
     return (
         CONFIG.paid_provider is not None
-        and budget.paid_fetches_today < CONFIG.MAX_PAID_FETCHES_PER_DAY          # default 100
-        and yield_score(page) >= CONFIG.PAID_FETCH_MIN_YIELD_SCORE               # default 0.30
-        and page.predicted_kind in ("hub", "item")                               # never pay for articles
-        and domain.paid_failures < 3                                             # provider also walled → stop paying
-        and page.wall_kind != "robots"                                           # a robots disallow is final, no paying around it
+        and budget.paid_fetches_today < CONFIG.MAX_PAID_FETCHES_PER_DAY  # default 100
+        and yield_score(page) >= CONFIG.PAID_FETCH_MIN_YIELD_SCORE  # default 0.30
+        and page.predicted_kind in ("hub", "item")  # never pay for articles
+        and domain.paid_failures < 3  # provider also walled → stop paying
+        and page.wall_kind != "robots"  # a robots disallow is final, no paying around it
     )
+
 
 def yield_score(page) -> float:
     # Laplace-smoothed new-useful-items per fetch of the best known evidence for this page
@@ -593,19 +672,23 @@ A walled page is re-checked after 30 days, then every 90 days, because walls com
 ### 4.7 Outage versus failure (port of research-queue)
 
 ```python
-OUTAGE = {"outage"}                 # 429, 5xx, connect timeout, reset, DNS SERVFAIL
-FAILURE = {"failure"}               # 404, 410, other 4xx, empty DOM, parse error
+OUTAGE = {"outage"}  # 429, 5xx, connect timeout, reset, DNS SERVFAIL
+FAILURE = {"failure"}  # 404, 410, other 4xx, empty DOM, parse error
+
 
 def on_result(page, domain, kind, retry_after: int | None):
     if kind == "outage":
         n = domain.outage_streak + 1
-        pause = retry_after or min(900 * 2 ** (n - 1), 86400)      # 15 min, 30, 60 … cap 24 h
-        domain.paused_until = now() + pause; domain.outage_streak = n
-        page.next_attempt_at = domain.paused_until                  # attempt refunded: strikes unchanged
+        pause = retry_after or min(900 * 2 ** (n - 1), 86400)  # 15 min, 30, 60 … cap 24 h
+        domain.paused_until = now() + pause
+        domain.outage_streak = n
+        page.next_attempt_at = domain.paused_until  # attempt refunded: strikes unchanged
     elif kind == "failure":
         page.strikes += 1
-        if page.strikes >= 3: page.status = "dead"
-        else: page.next_attempt_at = now() + 3600 * page.strikes
+        if page.strikes >= 3:
+            page.status = "dead"
+        else:
+            page.next_attempt_at = now() + 3600 * page.strikes
     else:
         domain.outage_streak = 0
 ```
@@ -1166,12 +1249,17 @@ When the pop returns fewer than 4 due pages, in order: (1) Exa `findSimilar` on 
 ```python
 async def main():
     while True:
-        if STOP.exists(): await asyncio.sleep(60); continue
+        if STOP.exists():
+            await asyncio.sleep(60)
+            continue
         guards = check_guards()
-        if guards.pause: await asyncio.sleep(guards.sleep_for); continue
+        if guards.pause:
+            await asyncio.sleep(guards.sleep_for)
+            continue
         wave = open_wave()
         pops = scheduler.pop(pages=24, searches=0 if not guards.exa else 12, max_per_domain=4)
-        if len(pops.pages) < 4: refill_frontier(guards)
+        if len(pops.pages) < 4:
+            refill_frontier(guards)
         enqueue_tasks(wave, pops)
         await asyncio.gather(collectors.run(wave), extractors.run(wave, llm=guards.llm), verifiers.run(wave))
         compiler.run_incremental(wave, llm=guards.llm, time_cap_sec=600)
@@ -1189,28 +1277,53 @@ async def main():
 ```python
 import ipaddress, socket
 
-DENY = [ipaddress.ip_network(n) for n in (
-    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10",        # CGNAT incl. Tailscale 100.x: no tailnet peers
-    "127.0.0.0/8", "169.254.0.0/16",                   # loopback, link-local incl. cloud metadata 169.254.169.254
-    "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24", "192.168.0.0/16", "198.18.0.0/15",
-    "198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4",
-    "::/128", "::1/128", "::ffff:0:0/96", "64:ff9b::/96", "fc00::/7", "fe80::/10", "ff00::/8")]
+DENY = [
+    ipaddress.ip_network(n)
+    for n in (
+        "0.0.0.0/8",
+        "10.0.0.0/8",
+        "100.64.0.0/10",  # CGNAT incl. Tailscale 100.x: no tailnet peers
+        "127.0.0.0/8",
+        "169.254.0.0/16",  # loopback, link-local incl. cloud metadata 169.254.169.254
+        "172.16.0.0/12",
+        "192.0.0.0/24",
+        "192.0.2.0/24",
+        "192.168.0.0/16",
+        "198.18.0.0/15",
+        "198.51.100.0/24",
+        "203.0.113.0/24",
+        "224.0.0.0/4",
+        "240.0.0.0/4",
+        "::/128",
+        "::1/128",
+        "::ffff:0:0/96",
+        "64:ff9b::/96",
+        "fc00::/7",
+        "fe80::/10",
+        "ff00::/8",
+    )
+]
 ALLOWED_PORTS = {80, 443}
+
 
 class SSRFBlocked(Exception): ...
 
+
 def resolve_and_pin(host: str, port: int) -> str:
-    if port not in ALLOWED_PORTS: raise SSRFBlocked(f"port {port}")
+    if port not in ALLOWED_PORTS:
+        raise SSRFBlocked(f"port {port}")
     try:
-        ipaddress.ip_address(host)                       # a bare IP literal is never allowed
+        ipaddress.ip_address(host)  # a bare IP literal is never allowed
         raise SSRFBlocked("ip literal")
     except ValueError:
         pass
     infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
     ips = {ipaddress.ip_address(i[4][0]) for i in infos}
-    if not ips: raise SSRFBlocked("no A/AAAA")
-    for ip in ips:                                        # ALL answers must be public: a mixed answer is a rebinding attempt
-        if any(ip in n for n in DENY): raise SSRFBlocked(f"{ip} denied")
+    if not ips:
+        raise SSRFBlocked("no A/AAAA")
+    for ip in ips:  # ALL answers must be public: a mixed answer is a rebinding attempt
+        if any(ip in n for n in DENY):
+            raise SSRFBlocked(f"{ip} denied")
     return str(sorted(ips, key=lambda i: (i.version, str(i)))[0])
 ```
 
@@ -1237,22 +1350,30 @@ class BM25:
         self.avgdl = sum(map(len, docs)) / max(1, len(docs))
         self.df = Counter(t for d in docs for t in set(d))
         self.N = len(docs)
-    def idf(self, t):  return math.log(1 + (self.N - self.df.get(t, 0) + 0.5) / (self.df.get(t, 0) + 0.5))
+
+    def idf(self, t):
+        return math.log(1 + (self.N - self.df.get(t, 0) + 0.5) / (self.df.get(t, 0) + 0.5))
+
     def score(self, q: list[str], i: int) -> float:
         d, tf = self.docs[i], Counter(self.docs[i])
-        return sum(self.idf(t) * tf[t] * (self.k1 + 1) / (tf[t] + self.k1 * (1 - self.b + self.b * len(d) / self.avgdl))
-                   for t in q if t in tf)
+        return sum(
+            self.idf(t) * tf[t] * (self.k1 + 1) / (tf[t] + self.k1 * (1 - self.b + self.b * len(d) / self.avgdl))
+            for t in q
+            if t in tf
+        )
+
 
 def filter_chunks(text: str, query: str, chunk_chars=800, keep_ratio=0.5, top=25) -> list[str]:
-    chunks = [text[i:i + chunk_chars] for i in range(0, len(text), chunk_chars)]
+    chunks = [text[i : i + chunk_chars] for i in range(0, len(text), chunk_chars)]
     toks = [re.sub(r"[^\w\s]", " ", c.casefold()).split() for c in chunks]
     bm = BM25(toks)
     q = re.sub(r"[^\w\s]", " ", query.casefold()).split()
     scored = sorted(((bm.score(q, i), i) for i in range(len(chunks))), reverse=True)
-    if not scored or scored[0][0] <= 0: return chunks[:top]
+    if not scored or scored[0][0] <= 0:
+        return chunks[:top]
     mx = scored[0][0]
     keep = sorted(i for s, i in scored[:top] if s >= keep_ratio * mx)
-    return [chunks[i] for i in keep]                  # original order preserved
+    return [chunks[i] for i in keep]  # original order preserved
 ```
 
 The query is the topic's `focus` plus the family's `focus` plus any entity names already attached to the page. The same `BM25` class with the FTS5 `bm25()` function behind it serves `snowball ask`.
@@ -1292,18 +1413,21 @@ Runs in the Verifier pool, per row and per claim.
 def quote_ok(quote: str, page_text: str) -> tuple[bool, int, int]:
     q, t = norm_text(quote).casefold(), norm_text(page_text).casefold()
     i = t.find(q)
-    if i >= 0: return True, i, i + len(q)
+    if i >= 0:
+        return True, i, i + len(q)
     # tolerate boilerplate stripping: best token window with >= 0.90 token Jaccard and length within 20%
     qt, tt = q.split(), t.split()
-    if len(qt) < 6: return False, -1, -1
+    if len(qt) < 6:
+        return False, -1, -1
     best = (0.0, -1)
     for start in range(0, max(1, len(tt) - len(qt) + 1)):
-        win = tt[start:start + len(qt)]
+        win = tt[start : start + len(qt)]
         j = jaccard(set(qt), set(win))
-        if j > best[0]: best = (j, start)
+        if j > best[0]:
+            best = (j, start)
     if best[0] >= 0.90:
-        s = len(" ".join(tt[:best[1]])) + (1 if best[1] else 0)
-        return True, s, s + len(" ".join(tt[best[1]:best[1] + len(qt)]))
+        s = len(" ".join(tt[: best[1]])) + (1 if best[1] else 0)
+        return True, s, s + len(" ".join(tt[best[1] : best[1] + len(qt)]))
     return False, -1, -1
 ```
 
@@ -1317,10 +1441,15 @@ A failing quote drops the row or claim. The page's `noise_count` increments; 5 n
 
 ```python
 SNOWFLAKE_EPOCH_MS = 1288834974657
+
+
 def snowflake_utc(post_id: str) -> datetime | None:
-    try: v = int(post_id)
-    except ValueError: return None
-    if v < (1 << 22): return None
+    try:
+        v = int(post_id)
+    except ValueError:
+        return None
+    if v < (1 << 22):
+        return None
     return datetime.fromtimestamp(((v >> 22) + SNOWFLAKE_EPOCH_MS) / 1000, tz=timezone.utc)
 ```
 
@@ -1401,14 +1530,17 @@ Array fields `aliases`, `sources`, `tags` are merged by code as **sorted set uni
 ```python
 BODY_SHRINK_THRESHOLD = 0.70
 
+
 def merge_summary(old: str, addition: str, llm) -> str:
-    if not old: return addition
-    proposed = llm.merge(old, addition)                       # Qwen 27B, SUMMARY_MERGE_BUDGET
+    if not old:
+        return addition
+    proposed = llm.merge(old, addition)  # Qwen 27B, SUMMARY_MERGE_BUDGET
     floor = BODY_SHRINK_THRESHOLD * max(len(old), len(addition))
     if proposed is None or len(proposed) < floor:
-        return old.rstrip() + "\n\n" + addition.strip()       # reject compaction loss: union fallback
-    for num in NUMBERS_RX.findall(old):                       # numbers in the old summary must survive
-        if num not in proposed: return old.rstrip() + "\n\n" + addition.strip()
+        return old.rstrip() + "\n\n" + addition.strip()  # reject compaction loss: union fallback
+    for num in NUMBERS_RX.findall(old):  # numbers in the old summary must survive
+        if num not in proposed:
+            return old.rstrip() + "\n\n" + addition.strip()
     return proposed
 ```
 

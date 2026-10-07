@@ -3323,6 +3323,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dry-run", action="store_true", help="simulate on an in-memory DB copy; no external calls")
     ap.add_argument("--status", action="store_true", help="frontier, token spend, domain yield")
     ap.add_argument("--json", action="store_true", help="print the result as JSON")
+    ap.add_argument("--seed-only", action="store_true", help="seed topics and exit")
     ap.add_argument("--db", type=Path, default=DB_PATH, help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
     cfg = load_config()
@@ -3334,6 +3335,10 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(st, indent=1, default=str))
         else:
             print_status(st)
+        return 0
+    if a.seed_only:
+        n = orch.seed_from_yaml()
+        print(f"seeded {n} topics")
         return 0
     lock_path = a.db.parent / "orchestrator.lock"
     with open(lock_path, "a") as fh:

@@ -70,6 +70,23 @@ def main() -> None:
     p_compile = sub.add_parser("compile", help="Compile Markdown knowledge base & entities")
     p_compile.add_argument("--out", type=Path, default=ROOT / "wiki", help="Output wiki path")
 
+    # 8. Seed
+    p_seed = sub.add_parser("seed", help="Seed topic grid from topics.yml into database")
+    p_seed.add_argument("--dry-run", action="store_true", help="Print deterministic hashes without writing")
+
+    # 9. Reindex
+    sub.add_parser("reindex", help="Rebuild FTS5 search indexes from database and markdown")
+
+    # 10. Eval
+    p_eval = sub.add_parser("eval", help="Execute benchmark evaluation gates")
+    p_eval_sub = p_eval.add_subparsers(dest="eval_cmd", required=True)
+    p_ec = p_eval_sub.add_parser("classify", help="Evaluate classifier accuracy (>=85%)")
+    p_ec.add_argument("fixture", type=Path, help="Path to pages_labelled_50.jsonl")
+    p_ee = p_eval_sub.add_parser("extract", help="Evaluate extraction schema and quote fidelity (100%)")
+    p_ee.add_argument("fixture", type=Path, help="Path to items_20.jsonl")
+    p_ed = p_eval_sub.add_parser("digest", help="Audit quotes in recent digests")
+    p_ed.add_argument("--since", type=str, default="7d", help="Time window (default: 7d)")
+
     parsed, remaining = ap.parse_known_args()
 
     cmd = parsed.command
@@ -125,6 +142,23 @@ def main() -> None:
 
     elif cmd == "compile":
         argv = ["tools/wiki_compiler.py", "--out", str(parsed.out)]
+        sys.exit(run_cmd(argv))
+    elif cmd == "seed":
+        argv = ["tools/orchestrator.py", "--seed-only"]
+        if parsed.dry_run:
+            argv.append("--dry-run")
+        sys.exit(run_cmd(argv))
+
+    elif cmd == "reindex":
+        argv = ["tools/eval_gates.py", "reindex"]
+        sys.exit(run_cmd(argv))
+
+    elif cmd == "eval":
+        argv = ["tools/eval_gates.py", parsed.eval_cmd]
+        if parsed.eval_cmd in ("classify", "extract"):
+            argv.append(str(parsed.fixture))
+        elif parsed.eval_cmd == "digest":
+            argv.extend(["--since", parsed.since])
         sys.exit(run_cmd(argv))
 
 

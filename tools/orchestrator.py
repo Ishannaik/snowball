@@ -29,6 +29,7 @@ stubbed, prints the calls it would make, and leaves data/snowball.db untouched.
 
 from __future__ import annotations
 
+import shutil
 import sys
 from pathlib import Path
 
@@ -44,7 +45,10 @@ if (
 
 import argparse
 import contextlib
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 import hashlib
 import ipaddress
 import json
@@ -70,6 +74,26 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from typing import Any
+
+def _flock_ex(fh: Any) -> None:
+    if fcntl is not None:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+    else:
+        import msvcrt
+        try:
+            msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+        except Exception:
+            pass
+
+def _flock_nb(fh: Any) -> None:
+    if fcntl is not None:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    else:
+        import msvcrt
+        try:
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError as e:
+            raise BlockingIOError('locked') from e
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -189,6 +213,8 @@ def load_config() -> Config:
     c.grok_x_poll_sec = gi("GROK_X_POLL_SEC", c.grok_x_poll_sec)
     c.grok_x_window_days = gi("GROK_X_WINDOW_DAYS", c.grok_x_window_days)
     c.omp_bin = env.get("OMP_BIN", c.omp_bin)
+    if not Path(c.omp_bin).exists():
+        c.omp_bin = shutil.which("omp") or c.omp_bin
     c.local_base_url = env.get("OPENAI_BASE_URL", c.local_base_url).rstrip("/")
     c.local_model = env.get("LOCAL_MODEL", c.local_model)
     c.local_fallback_model = env.get("LOCAL_FALLBACK_MODEL", c.local_fallback_model)
@@ -1290,7 +1316,8 @@ class GrokAdversarialVerifier(Engine):
     name = "grok"
 
     def available(self) -> tuple[bool, str]:
-        if not self.dry and not Path(self.cfg.omp_bin).exists():
+        resolved_omp = shutil.which(self.cfg.omp_bin) or (self.cfg.omp_bin if Path(self.cfg.omp_bin).exists() else None)
+        if not self.dry and not resolved_omp:
             return False, f"omp not found at {self.cfg.omp_bin}"
         return super().available()
 
@@ -1446,7 +1473,7 @@ class LocalOrnithFallback(Engine):
             try:
                 if model == self.cfg.local_model:
                     with open(ORNITH_LOCK, "a") as fh:
-                        fcntl.flock(fh, fcntl.LOCK_EX)  # one request in flight to Ornith's single T4 slot
+                        _flock_ex(fh)  # one request in flight to Ornith's single T4 slot
                         return self._stream(model, system, user, max_out)
                 return self._stream(model, system, user, max_out)
             except (EngineOutage, EngineFailure) as e:
@@ -3304,7 +3331,7 @@ def main(argv: list[str] | None = None) -> int:
     lock_path = a.db.parent / "orchestrator.lock"
     with open(lock_path, "a") as fh:
         try:
-            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)  # one batch at a time; the DB is single-writer anyway
+            _flock_nb(fh)  # one batch at a time; the DB is single-writer anyway
         except BlockingIOError:
             log("another orchestrator run holds the lock; exiting")
             return 3

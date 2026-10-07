@@ -14,6 +14,7 @@ under its cooldown (6 h, or 7 days for a rejected key). Also reads omp's own Exa
                                        lines for keys that went spent/parked since the last call,
                                        and write the summary once the 5th key is gone.
 """
+
 import json
 import time
 from pathlib import Path
@@ -67,12 +68,21 @@ def track(searches: int, topics: int) -> None:
         st = {}
     keys = rotator_keys()
     if not st:  # first call: baseline. Keys already parked now are not counted as loop burn.
-        st = {"start": now, "searches": 0, "topics": 0, "baseline_parked": [k[0] for k in keys if k[1]],
-              "gone": [], "summary": None, "summary_in_digest": False}
-        BURN_MD.write_text("# Exa burn log (append-only)\n\nStarted "
-                           f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(now))} IST with {len(keys)} keys, "
-                           f"{len(st['baseline_parked'])} already parked. Searches = loop web_search calls only; "
-                           "other users of the pool (Claude Code, Hermes, omp) also burn keys.\n\n")
+        st = {
+            "start": now,
+            "searches": 0,
+            "topics": 0,
+            "baseline_parked": [k[0] for k in keys if k[1]],
+            "gone": [],
+            "summary": None,
+            "summary_in_digest": False,
+        }
+        BURN_MD.write_text(
+            "# Exa burn log (append-only)\n\nStarted "
+            f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(now))} IST with {len(keys)} keys, "
+            f"{len(st['baseline_parked'])} already parked. Searches = loop web_search calls only; "
+            "other users of the pool (Claude Code, Hermes, omp) also burn keys.\n\n"
+        )
     st["searches"] += searches
     st["topics"] += topics
     lines = []
@@ -80,18 +90,22 @@ def track(searches: int, topics: int) -> None:
         if parked and label not in st["gone"] and label not in st["baseline_parked"]:
             st["gone"].append(label)
             when = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(spent))) if spent else "?"
-            lines.append(f"- {when} key `{label}` parked ({reason or 'spent'}). Gone since start: {len(st['gone'])}. "
-                         f"Loop searches so far: {st['searches']}. Topics so far: {st['topics']}. Live now: "
-                         f"{sum(1 for k in keys if not k[1])}.\n")
+            lines.append(
+                f"- {when} key `{label}` parked ({reason or 'spent'}). Gone since start: {len(st['gone'])}. "
+                f"Loop searches so far: {st['searches']}. Topics so far: {st['topics']}. Live now: "
+                f"{sum(1 for k in keys if not k[1])}.\n"
+            )
     if len(st["gone"]) >= 5 and not st["summary"]:
         hours = (now - st["start"]) / 3600
         gone = len(st["gone"])
         live = sum(1 for k in keys if not k[1])
         hpk = hours / gone
-        st["summary"] = (f"SUMMARY after {gone} keys gone: {hours:.1f} h elapsed, {st['searches'] / gone:.0f} loop "
-                         f"searches per key, {st['topics'] / gone:.1f} topics per key. At {hpk:.1f} h per key the "
-                         f"{live} live keys last about {live * hpk / 24:.1f} days (counting the {RESERVE}-key reserve "
-                         f"the loop leaves: {max(0, live - RESERVE) * hpk / 24:.1f} days of loop use).")
+        st["summary"] = (
+            f"SUMMARY after {gone} keys gone: {hours:.1f} h elapsed, {st['searches'] / gone:.0f} loop "
+            f"searches per key, {st['topics'] / gone:.1f} topics per key. At {hpk:.1f} h per key the "
+            f"{live} live keys last about {live * hpk / 24:.1f} days (counting the {RESERVE}-key reserve "
+            f"the loop leaves: {max(0, live - RESERVE) * hpk / 24:.1f} days of loop use)."
+        )
         lines.append(st["summary"] + "\n")
     if lines:
         with BURN_MD.open("a") as f:
@@ -102,6 +116,7 @@ def track(searches: int, topics: int) -> None:
 
 if __name__ == "__main__":
     import sys
+
     cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
     if cmd == "track":
         track(int(sys.argv[2]), int(sys.argv[3]))

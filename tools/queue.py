@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
 """Topic queue for the research loop (topics.yml).
 
-  queue.py pick N                 print up to N "slug public|private" lines (queued first, else suggested)
-  queue.py prompt SLUG OUT MIN    print the filled research prompt (env EXA_LEFT caps web_search calls)
-  queue.py done SLUG REPORT       mark done, append up to 2 SUGGEST lines (max 3 new per day)
-  queue.py budget get             print today's budget counters as JSON
-  queue.py budget add FIELD N     add N to a counter (topic_runs, exa, suggestions)
+queue.py pick N                 print up to N "slug public|private" lines (queued first, else suggested)
+queue.py prompt SLUG OUT MIN    print the filled research prompt (env EXA_LEFT caps web_search calls)
+queue.py done SLUG REPORT       mark done, append up to 2 SUGGEST lines (max 3 new per day)
+queue.py budget get             print today's budget counters as JSON
+queue.py budget add FIELD N     add N to a counter (topic_runs, exa, suggestions)
 """
 
 import datetime as dt
+import json
 import os
 import re
 import sys
 from pathlib import Path
-
-import json
 
 import yaml
 
@@ -28,8 +27,10 @@ HEADER = """# Research queue. run.sh picks status: queued topics in order (lowes
 # The agent appends up to 2 "suggested" topics per run. Suggested topics run only when
 # nothing is queued. Promote one by changing its status to queued.
 """
-TMJ_EXTRA = ("This topic is health related. Label every finding as anecdotal. Do not give medical advice "
-             "or instructions. Put this line under the title: '> Anecdotal forum reports, not medical advice.'")
+TMJ_EXTRA = (
+    "This topic is health related. Label every finding as anecdotal. Do not give medical advice "
+    "or instructions. Put this line under the title: '> Anecdotal forum reports, not medical advice.'"
+)
 
 
 def load():
@@ -90,11 +91,16 @@ def make_deepen(d):
     _, base = min(cands, key=lambda x: x[0])
     base["last_deepened"] = today.isoformat()
     slug = f"{base['slug']}-deep-{today.strftime('%m%d')}"
-    t = {"slug": slug, "priority": 40, "status": "queued", "deepen_of": base["slug"],
-         "title": f"{base['title']} (deepening: open gaps)",
-         "focus": "Fill the gaps the last report left open. Re-check its claims that changed since. Gaps: "
-                  + gaps_of(base["slug"]),
-         "forums": base.get("forums", [])}
+    t = {
+        "slug": slug,
+        "priority": 40,
+        "status": "queued",
+        "deepen_of": base["slug"],
+        "title": f"{base['title']} (deepening: open gaps)",
+        "focus": "Fill the gaps the last report left open. Re-check its claims that changed since. Gaps: "
+        + gaps_of(base["slug"]),
+        "forums": base.get("forums", []),
+    }
     if base.get("private"):
         t["private"] = True
     d["topics"].append(t)
@@ -124,10 +130,15 @@ def prompt(slug, out, minutes):
     text = (ROOT / "prompts/research.md").read_text()
     health = any(w in (t["title"] + t.get("focus", "")).lower() for w in ("tmj", "medical", "health", "jaw"))
     fills = {
-        "TITLE": t["title"], "FOCUS": " ".join((t.get("focus") or "").split()), "SLUG": slug,
+        "TITLE": t["title"],
+        "FOCUS": " ".join((t.get("focus") or "").split()),
+        "SLUG": slug,
         "FORUMS": ", ".join(t.get("forums") or []) or "pick the most relevant ones",
-        "DATE": dt.date.today().isoformat(), "OUT": out, "MINUTES": minutes,
-        "FORUM_PY": str(ROOT / "tools/forum.py"), "EXTRA": TMJ_EXTRA if health else "",
+        "DATE": dt.date.today().isoformat(),
+        "OUT": out,
+        "MINUTES": minutes,
+        "FORUM_PY": str(ROOT / "tools/forum.py"),
+        "EXTRA": TMJ_EXTRA if health else "",
         "EXA_LEFT": os.environ.get("EXA_LEFT", "10"),
     }
     for k, v in fills.items():
@@ -148,9 +159,16 @@ def done(slug, report):
         s, title = m.group(1), m.group(2)
         if s in known or added >= min(2, room):
             continue
-        d["topics"].append({"slug": s, "priority": 50, "status": "suggested", "title": title,
-                            "focus": f"Follow-up suggested by the {slug} run on {t['last_run']}.",
-                            "suggested_by": slug})
+        d["topics"].append(
+            {
+                "slug": s,
+                "priority": 50,
+                "status": "suggested",
+                "title": title,
+                "focus": f"Follow-up suggested by the {slug} run on {t['last_run']}.",
+                "suggested_by": slug,
+            }
+        )
         known.add(s)
         added += 1
     save(d)

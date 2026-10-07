@@ -35,6 +35,8 @@ def channel_id() -> str:
             if line.strip().startswith("DIGEST_CHANNEL_ID="):
                 val = line.split("=", 1)[1].strip().strip("'\"")
     return val
+
+
 UA = "DiscordBot (https://github.com/Ishannaik, 1.0)"
 
 
@@ -78,8 +80,10 @@ def build(run, prefix):
     lines.append("Topics done: " + (", ".join(t["slug"] for t in ok) or "none") + ".")
     if bad:
         lines.append("Topics failed: " + ", ".join(t["slug"] for t in bad) + ".")
-    lines.append(f"Wiki pages: {len(run.get('created', []))} created, {len(run.get('updated', []))} updated."
-                 + (f" Commit {run['commit'][:8]}." if run.get("commit") else ""))
+    lines.append(
+        f"Wiki pages: {len(run.get('created', []))} created, {len(run.get('updated', []))} updated."
+        + (f" Commit {run['commit'][:8]}." if run.get("commit") else "")
+    )
     picks = []
     for t in ok:
         picks += findings(t["report"], 3)
@@ -108,10 +112,27 @@ def post(msg, channel):
         hdr = h.name
     try:
         r = subprocess.run(
-            ["curl", "-s", "-m", "30", "-X", "POST", "-H", f"@{hdr}", "-H", "Content-Type: application/json",
-             "-H", f"User-Agent: {UA}", "--data", f"@{body}",
-             f"https://discord.com/api/v10/channels/{channel}/messages"],
-            capture_output=True, text=True, timeout=45)
+            [
+                "curl",
+                "-s",
+                "-m",
+                "30",
+                "-X",
+                "POST",
+                "-H",
+                f"@{hdr}",
+                "-H",
+                "Content-Type: application/json",
+                "-H",
+                f"User-Agent: {UA}",
+                "--data",
+                f"@{body}",
+                f"https://discord.com/api/v10/channels/{channel}/messages",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
     finally:
         Path(hdr).unlink(missing_ok=True)
         Path(body).unlink(missing_ok=True)
@@ -126,6 +147,7 @@ def post(msg, channel):
 
 def merge_daily():
     import time
+
     logs = Path(__file__).resolve().parent.parent / "logs"
     run = {"daily": True, "date": time.strftime("%Y-%m-%d"), "topics": [], "created": [], "updated": [], "notes": []}
     for f in sorted(logs.glob("run-*.json")):

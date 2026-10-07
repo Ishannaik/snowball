@@ -1,0 +1,73 @@
+name: CI / Code Quality & Automated Verification
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  lint:
+    name: Static Analysis & Linting (Ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Linting Tools
+        run: |
+          pip install ruff
+
+      - name: Run Ruff Linter
+        run: |
+          ruff check .
+
+      - name: Run Ruff Formatter Check
+        run: |
+          ruff format --check .
+
+  test:
+    name: Test Suite & Regression Verification
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install Runtime Dependencies
+        run: |
+          pip install pyyaml curl_cffi
+
+      - name: Run Python Unit Tests
+        run: |
+          python3 -m unittest discover -s tests -p "test_*.py" -v
+
+      - name: Test Orchestrator Dry-Run & Status CLI
+        run: |
+          python3 tools/orchestrator.py --dry-run --status
+
+  security:
+    name: Security & Secret Hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Verify Sensitive Files Gitignored
+        run: |
+          git status --ignored
+          test ! -f .env || (echo "ERROR: .env committed to repository!" && exit 1)

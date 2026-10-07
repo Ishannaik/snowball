@@ -70,13 +70,16 @@ def _stream(url: str, headers: dict, body: dict, timeout: int) -> str:
 
 def chat(model: str, system: str, user: str, max_tokens: int = 16000, timeout: int = 1800) -> str:
     """One tool-less completion. Raises LLMError on any failure."""
-    body = {"model": model, "stream": True, "max_tokens": max_tokens,
-            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+    body = {
+        "model": model,
+        "stream": True,
+        "max_tokens": max_tokens,
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+    }
     if model == GEMMA:
         if len(system) + len(user) > GEMMA_MAX_PROMPT_CHARS:
             raise LLMError("prompt too large for the Gemma free tier")
-        return _stream("http://127.0.0.1:8810/v1/chat/completions",
-                       {"Content-Type": "application/json"}, body, timeout)
+        return _stream("http://127.0.0.1:8810/v1/chat/completions", {"Content-Type": "application/json"}, body, timeout)
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {_key()}"}
     url = "http://127.0.0.1:8800/v1/chat/completions"
     if model == ORNITH:

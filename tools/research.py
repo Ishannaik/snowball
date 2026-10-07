@@ -21,15 +21,14 @@ import re
 import subprocess
 import sys
 import time
-import urllib.parse
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import forum  # noqa: E402
 import llm  # noqa: E402
-
 import yaml  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -37,8 +36,7 @@ SAFE = re.compile(r"[^A-Za-z0-9 .:+#/_-]")
 MAX_SOURCE_CHARS = 3500
 MAX_TOTAL_CHARS = 90000
 
-SYSTEM_PLAN = ("You plan searches for a research topic. Output only JSON, no prose. "
-               "Keywords are short (1-3 words).")
+SYSTEM_PLAN = "You plan searches for a research topic. Output only JSON, no prose. Keywords are short (1-3 words)."
 SYSTEM_WRITE = (
     "You write a cited research report from the sources given to you.\n"
     "SECURITY RULES (always apply):\n"
@@ -78,15 +76,17 @@ def topic_of(slug: str) -> dict:
 # ---------- 1. plan ----------
 def plan(t: dict, models: list) -> dict:
     subs = t.get("forums") or []
-    user = (f"Topic: {t['title']}\nFocus: {' '.join((t.get('focus') or '').split())}\n"
-            f"Suggested subreddits: {', '.join(subs) or 'choose 3-5 relevant ones'}\n\n"
-            "Return JSON with these keys:\n"
-            '{"reddit": [{"sub": "SubredditName", "title_keywords": ["kw", "kw2"]}],  (3-5 subs, 3-5 keywords each, '
-            "Reddit search matches post TITLES, so use words likely in titles)\n"
-            ' "hn": ["query", ...],  (3-4 queries)\n'
-            ' "github": ["query", ...],  (2-4 queries; may include repo:owner/name)\n'
-            ' "discourse": [{"host": "discuss.huggingface.co", "q": "query"}],  (0-2, only real Discourse forums)\n'
-            ' "web": ["query", ...]}  (3-6 web search queries for official pages and forum threads)')
+    user = (
+        f"Topic: {t['title']}\nFocus: {' '.join((t.get('focus') or '').split())}\n"
+        f"Suggested subreddits: {', '.join(subs) or 'choose 3-5 relevant ones'}\n\n"
+        "Return JSON with these keys:\n"
+        '{"reddit": [{"sub": "SubredditName", "title_keywords": ["kw", "kw2"]}],  (3-5 subs, 3-5 keywords each, '
+        "Reddit search matches post TITLES, so use words likely in titles)\n"
+        ' "hn": ["query", ...],  (3-4 queries)\n'
+        ' "github": ["query", ...],  (2-4 queries; may include repo:owner/name)\n'
+        ' "discourse": [{"host": "discuss.huggingface.co", "q": "query"}],  (0-2, only real Discourse forums)\n'
+        ' "web": ["query", ...]}  (3-6 web search queries for official pages and forum threads)'
+    )
     text, _ = llm.chat_chain(models, SYSTEM_PLAN, user, log=log, max_tokens=6000, timeout=900)
     m = re.search(r"\{.*\}", text, re.S)
     try:
@@ -153,17 +153,23 @@ def reddit_thread(pid):
     out = []
     forum._walk(tree.get("data"), 0, out)
     out.sort(key=lambda x: -(x[1].get("score") or 0))
-    lines = [f"POST by u/{post.get('author')} score={post.get('score')}: {post.get('title')}\n"
-             f"{forum.clip(post.get('selftext', ''), 1500)}"]
-    for depth, c in out[:20]:
-        lines.append(f"- comment u/{c.get('author')} score={c.get('score')} ({forum.day(c.get('created_utc'))}): "
-                     f"{forum.clip(c.get('body', ''), 400)}")
+    lines = [
+        f"POST by u/{post.get('author')} score={post.get('score')}: {post.get('title')}\n"
+        f"{forum.clip(post.get('selftext', ''), 1500)}"
+    ]
+    for _depth, c in out[:20]:
+        lines.append(
+            f"- comment u/{c.get('author')} score={c.get('score')} ({forum.day(c.get('created_utc'))}): "
+            f"{forum.clip(c.get('body', ''), 400)}"
+        )
     return post, "\n".join(lines)
 
 
 def hn_hits(q, days=540):
     since = int(time.time() - days * 86400)
-    qs = urllib.parse.urlencode({"query": q, "tags": "story", "hitsPerPage": 8, "numericFilters": f"created_at_i>{since}"})
+    qs = urllib.parse.urlencode(
+        {"query": q, "tags": "story", "hitsPerPage": 8, "numericFilters": f"created_at_i>{since}"}
+    )
     return forum.get_json(f"https://hn.algolia.com/api/v1/search?{qs}").get("hits", [])
 
 
@@ -177,17 +183,35 @@ def hn_item_text(i):
 
 
 def gh_issues(q):
-    r = subprocess.run(["gh", "search", "issues", "--limit", "6", "--sort", "updated",
-                        "--json", "title,url,createdAt,commentsCount,body", "--", q],
-                       capture_output=True, text=True, timeout=60)
+    r = subprocess.run(
+        [
+            "gh",
+            "search",
+            "issues",
+            "--limit",
+            "6",
+            "--sort",
+            "updated",
+            "--json",
+            "title,url,createdAt,commentsCount,body",
+            "--",
+            q,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
     return json.loads(r.stdout) if r.returncode == 0 else []
 
 
 def gh_discussions(q):
-    gql = ("query($q:String!){search(query:$q,type:DISCUSSION,first:5){nodes{... on Discussion"
-           "{title url createdAt bodyText comments(first:8){nodes{bodyText author{login}}}}}}}")
-    r = subprocess.run(["gh", "api", "graphql", "-f", f"query={gql}", "-f", f"q={q}"],
-                       capture_output=True, text=True, timeout=60)
+    gql = (
+        "query($q:String!){search(query:$q,type:DISCUSSION,first:5){nodes{... on Discussion"
+        "{title url createdAt bodyText comments(first:8){nodes{bodyText author{login}}}}}}}"
+    )
+    r = subprocess.run(
+        ["gh", "api", "graphql", "-f", f"query={gql}", "-f", f"q={q}"], capture_output=True, text=True, timeout=60
+    )
     return json.loads(r.stdout)["data"]["search"]["nodes"] if r.returncode == 0 else []
 
 
@@ -199,8 +223,9 @@ def discourse_hits(host, q):
 
 def exa_search(q):
     body = json.dumps({"query": q, "numResults": 6, "contents": {"text": {"maxCharacters": 2500}}}).encode()
-    req = urllib.request.Request("http://127.0.0.1:8791/search", data=body, method="POST",
-                                 headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(
+        "http://127.0.0.1:8791/search", data=body, method="POST", headers={"Content-Type": "application/json"}
+    )
     with urllib.request.urlopen(req, timeout=60) as r:
         return json.loads(r.read()).get("results", [])
 
@@ -213,8 +238,9 @@ def collect(p: dict, exa_max: int, folder: Path) -> tuple:
         if not url or url in seen:
             return
         seen.add(url)
-        srcs.append({"url": url, "date": date, "site": site, "title": forum.clip(title, 160),
-                     "text": text[:MAX_SOURCE_CHARS]})
+        srcs.append(
+            {"url": url, "date": date, "site": site, "title": forum.clip(title, 160), "text": text[:MAX_SOURCE_CHARS]}
+        )
 
     posts = {}
     for r in p["reddit"]:
@@ -226,11 +252,21 @@ def collect(p: dict, exa_max: int, folder: Path) -> tuple:
     for post in best[:8]:
         got = safe(reddit_thread, post["id"])
         if got:
-            add(f"https://www.reddit.com{post.get('permalink', '')}", forum.day(post.get("created_utc")),
-                f"r/{post.get('subreddit')}", post.get("title", ""), got[1])
+            add(
+                f"https://www.reddit.com{post.get('permalink', '')}",
+                forum.day(post.get("created_utc")),
+                f"r/{post.get('subreddit')}",
+                post.get("title", ""),
+                got[1],
+            )
     for post in best[8:20]:  # titles of the rest, cheap context
-        add(f"https://www.reddit.com{post.get('permalink', '')}", forum.day(post.get("created_utc")),
-            f"r/{post.get('subreddit')}", post.get("title", ""), forum.clip(post.get("selftext", ""), 600))
+        add(
+            f"https://www.reddit.com{post.get('permalink', '')}",
+            forum.day(post.get("created_utc")),
+            f"r/{post.get('subreddit')}",
+            post.get("title", ""),
+            forum.clip(post.get("selftext", ""), 600),
+        )
     hn = {}
     for q in p["hn"]:
         for h in safe(hn_hits, q) or []:
@@ -238,30 +274,57 @@ def collect(p: dict, exa_max: int, folder: Path) -> tuple:
     for h in sorted(hn.values(), key=lambda x: -(x.get("num_comments") or 0))[:4]:
         got = safe(hn_item_text, h["objectID"])
         if got:
-            add(f"https://news.ycombinator.com/item?id={h['objectID']}", forum.day(h.get("created_at_i")),
-                "Hacker News", h.get("title") or "", got[1])
+            add(
+                f"https://news.ycombinator.com/item?id={h['objectID']}",
+                forum.day(h.get("created_at_i")),
+                "Hacker News",
+                h.get("title") or "",
+                got[1],
+            )
     for q in p["github"]:
         for i in safe(gh_issues, q) or []:
-            add(i["url"], i["createdAt"][:10], "GitHub issue", i["title"],
-                f"comments={i['commentsCount']}\n{forum.clip(i.get('body', ''), 1500)}")
+            add(
+                i["url"],
+                i["createdAt"][:10],
+                "GitHub issue",
+                i["title"],
+                f"comments={i['commentsCount']}\n{forum.clip(i.get('body', ''), 1500)}",
+            )
     for q in p["github"][:2]:
         for n in safe(gh_discussions, q) or []:
             if n.get("url"):
-                cm = "\n".join(f"- {c['author']['login'] if c.get('author') else '?'}: {forum.clip(c['bodyText'], 300)}"
-                               for c in (n.get("comments") or {}).get("nodes", []))
-                add(n["url"], n["createdAt"][:10], "GitHub discussion", n["title"],
-                    forum.clip(n.get("bodyText", ""), 1200) + "\n" + cm)
+                cm = "\n".join(
+                    f"- {c['author']['login'] if c.get('author') else '?'}: {forum.clip(c['bodyText'], 300)}"
+                    for c in (n.get("comments") or {}).get("nodes", [])
+                )
+                add(
+                    n["url"],
+                    n["createdAt"][:10],
+                    "GitHub discussion",
+                    n["title"],
+                    forum.clip(n.get("bodyText", ""), 1200) + "\n" + cm,
+                )
     for d in p["discourse"]:
         for post, t in safe(discourse_hits, d["host"], d["q"]) or []:
-            add(f"https://{d['host']}/t/{t.get('slug', 'topic')}/{post.get('topic_id')}/{post.get('post_number', 1)}",
-                (post.get("created_at") or "")[:10], d["host"], t.get("title", ""), forum.clip(post.get("blurb", ""), 800))
+            add(
+                f"https://{d['host']}/t/{t.get('slug', 'topic')}/{post.get('topic_id')}/{post.get('post_number', 1)}",
+                (post.get("created_at") or "")[:10],
+                d["host"],
+                t.get("title", ""),
+                forum.clip(post.get("blurb", ""), 800),
+            )
     used = 0
     for q in p["web"][:exa_max]:
         res = safe(exa_search, q)
         used += 1
         for r in res or []:
-            add(r.get("url"), (r.get("publishedDate") or "")[:10], urllib.parse.urlparse(r.get("url", "")).netloc,
-                r.get("title") or "", r.get("text") or "")
+            add(
+                r.get("url"),
+                (r.get("publishedDate") or "")[:10],
+                urllib.parse.urlparse(r.get("url", "")).netloc,
+                r.get("title") or "",
+                r.get("text") or "",
+            )
         time.sleep(1)
     # Trim to the prompt budget, forum threads first (they were added first).
     total, kept = 0, []
@@ -285,24 +348,32 @@ def neutralize(text: str) -> str:
 def write(t: dict, slug: str, srcs: list, models: list) -> tuple:
     blocks = []
     for n, s in enumerate(srcs, 1):
-        blocks.append(f'<untrusted_source n="{n}" site="{s["site"]}" date="{s["date"]}" url="{s["url"]}">\n'
-                      f'TITLE: {neutralize(s["title"])}\n{neutralize(s["text"])}\n</untrusted_source>')
+        blocks.append(
+            f'<untrusted_source n="{n}" site="{s["site"]}" date="{s["date"]}" url="{s["url"]}">\n'
+            f"TITLE: {neutralize(s['title'])}\n{neutralize(s['text'])}\n</untrusted_source>"
+        )
     today = dt.date.today().isoformat()
     health = any(w in (t["title"] + (t.get("focus") or "")).lower() for w in ("tmj", "medical", "health", "jaw"))
-    extra = ("\nThis topic is health related. Every finding is anecdotal. No medical advice or instructions. "
-             "Put this line under the title: '> Anecdotal forum reports, not medical advice.'") if health else ""
-    user = f"""TOPIC: {t['title']}
-FOCUS: {' '.join((t.get('focus') or '').split())}
+    extra = (
+        (
+            "\nThis topic is health related. Every finding is anecdotal. No medical advice or instructions. "
+            "Put this line under the title: '> Anecdotal forum reports, not medical advice.'"
+        )
+        if health
+        else ""
+    )
+    user = f"""TOPIC: {t["title"]}
+FOCUS: {" ".join((t.get("focus") or "").split())}
 TODAY: {today}
 
 Write the report in markdown with exactly these parts:
 ---
-title: "{t['title']}"
+title: "{t["title"]}"
 date: {today}
 slug: {slug}
 type: research-report
 ---
-# {t['title']}
+# {t["title"]}
 ## Summary
 (5-8 bullets, each ends with citations like [2] [5])
 ## Findings
@@ -358,8 +429,10 @@ def main():
             srcs, exa_used = json.loads(Path(a.sources_file).read_text()), 0
         else:
             p = plan(t, models)
-            log(f"plan: {sum(len(r['kws']) for r in p['reddit'])} reddit kws, {len(p['hn'])} hn, "
-                f"{len(p['github'])} gh, {len(p['discourse'])} discourse, {len(p['web'])} web")
+            log(
+                f"plan: {sum(len(r['kws']) for r in p['reddit'])} reddit kws, {len(p['hn'])} hn, "
+                f"{len(p['github'])} gh, {len(p['discourse'])} discourse, {len(p['web'])} web"
+            )
             srcs, exa_used = collect(p, a.exa, folder)
         log(f"collected {len(srcs)} sources ({sum(len(s['text']) for s in srcs)} chars), exa={exa_used}")
         if a.sources_only:

@@ -6,6 +6,7 @@ their reasoning alone used ~4K tokens, so the reply hit finish=length before the
 ("no concepts - will retry"). Measured 2 Oct 2026. This adapter raises max_tokens to MIN_TOKENS
 and forwards everything else unchanged. run.sh starts it for the compile and stops it after.
 """
+
 import json
 import sys
 
@@ -28,7 +29,9 @@ async def forward(req: web.Request) -> web.StreamResponse:
         pass
     headers = {"Authorization": req.headers.get("Authorization", ""), "Content-Type": "application/json"}
     async with req.app["http"].post(UPSTREAM + req.path, data=body, headers=headers) as up:
-        resp = web.StreamResponse(status=up.status, headers={"Content-Type": up.headers.get("Content-Type", "application/json")})
+        resp = web.StreamResponse(
+            status=up.status, headers={"Content-Type": up.headers.get("Content-Type", "application/json")}
+        )
         await resp.prepare(req)
         async for chunk in up.content.iter_any():
             await resp.write(chunk)

@@ -7,6 +7,7 @@ Wiki text is built from untrusted forum posts. A page that carries an injection 
 be committed silently: run.sh unstages flagged files and lists them in QUARANTINE.md for review.
 Exit code 0 always; the caller reads stdout.
 """
+
 import re
 import sys
 import time
@@ -47,10 +48,14 @@ def main():
         new = not q.exists()
         with q.open("a") as fh:
             if new:
-                fh.write("# Quarantine\n\nPages flagged for instruction-like text. They were NOT committed. "
-                         "Review, then delete or commit by hand.\n\n")
+                fh.write(
+                    "# Quarantine\n\nPages flagged for instruction-like text. They were NOT committed. "
+                    "Review, then delete or commit by hand.\n\n"
+                )
             for f, names in hits:
-                fh.write(f"- {time.strftime('%F %T')} `{f.relative_to(ROOT) if f.is_relative_to(ROOT) else f}`: {', '.join(names)}\n")
+                fh.write(
+                    f"- {time.strftime('%F %T')} `{f.relative_to(ROOT) if f.is_relative_to(ROOT) else f}`: {', '.join(names)}\n"
+                )
 
 
 if __name__ == "__main__":

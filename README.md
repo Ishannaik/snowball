@@ -14,6 +14,7 @@ The status today is **v0, a fork of the research-wiki loop**. It already runs un
 | `run.sh` | One research run: pick a topic, collect, write, compile the wiki, commit. |
 | `tools/research.py` | Collect sources (Exa, Arctic Shift, GitHub, HN), plan, write, verify citations. |
 | `tools/queue.py` | Topic queue (`topics.yml` today, SQLite next). |
+| `tools/orchestrator.py` | Multi-model wave runner on `data/snowball.db`: Gemini extracts, Grok 4.7 xhigh rejects, local models only for private topics. `--status`, `--dry-run`, `--mode`. Settings in `config.env`. |
 | `tools/quarantine.py` | Injection scan. Scraped pages can never add topics or instructions. |
 | `tools/exa_budget.py` | Exa key pool budget and live-key floor. |
 | `tools/digest.py` | Daily Discord digest. The channel is set in `config.env`. |

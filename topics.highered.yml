@@ -1,0 +1,74 @@
+# Public research only: no transcripts, personal finances, or inferred grades.
+# Prior Hermes work is historical context, not evidence for current eligibility.
+families:
+  opportunities:
+    recheck_days: 1
+    weight: 1.0
+    relevance_floor: 0.08
+    focus: >-
+      Funding-first, on-campus CS and AI master's degrees for Indian applicants
+      entering in 2027. Prefer official university and scholarship sources.
+      Separate guaranteed tuition and living support from competitive awards,
+      fee waivers, loans, and tuition-only discounts. Record deadlines, admission
+      eligibility, visa cash requirements, and costs in the source currency.
+      Do not infer personal eligibility or treat stale calls as open.
+seeds:
+  - id: highered-canada-thesis-2027
+    family: opportunities
+    title: Canada funded thesis CS and AI master's, 2027
+    focus: >-
+      UBC computer science MSc thesis and Waterloo computer science MMath
+      international Indian applicants 2027 admission deadlines guaranteed
+      research master's funding tuition fees stipend official university pages;
+      exclude online and course-only degrees and separate tuition from living costs
+    regions: [canada]
+    audiences: [students]
+  - id: highered-erasmus-ai-2027
+    family: opportunities
+    title: Erasmus Mundus on-campus CS and AI scholarships, 2027
+    focus: >-
+      Erasmus Mundus joint masters artificial intelligence computer science
+      2027 scholarship applications official consortium dates Indian eligibility
+      full tuition monthly stipend insurance travel living costs versus self-funded seats
+    regions: [europe]
+    audiences: [students]
+  - id: highered-gulf-ms-2027
+    family: opportunities
+    title: Gulf funded on-campus AI master's, 2027
+    focus: >-
+      MBZUAI KAUST KFUPM on-campus research MS artificial intelligence computer
+      science 2027 official admission deadlines Indian eligibility graduate
+      scholarship tuition stipend accommodation insurance funding conditions;
+      distinguish research MS from professional paid programmes
+    regions: [global]
+    audiences: [students]
+  - id: highered-germany-cash-gates-2027
+    family: opportunities
+    title: Germany CS master's funding and visa cash gates, 2027
+    focus: >-
+      Germany on-campus English taught computer science master's 2027 Indian
+      APS dMAT eligibility official requirements Saarland RWTH tuition semester
+      fees scholarships visa blocked account living costs; tuition-free is not
+      a full ride and hoped-for student employment is not guaranteed funding
+    regions: [germany]
+    audiences: [students]
+  - id: highered-india-scholarship-2027
+    family: opportunities
+    title: Indian overseas master's scholarships versus loans, 2027
+    focus: >-
+      JN Tata Endowment KC Mahindra Inlaks Narotam Sekhsaria 2027 official
+      overseas on-campus computer science master's eligibility application
+      deadlines grants versus loan scholarships interest guarantor repayment
+      stacking restrictions and upfront application costs in INR
+    regions: [india]
+    audiences: [students]
+  - id: highered-direct-phd-alternative-2027
+    family: opportunities
+    title: Separately labelled funded direct-PhD alternative, 2027
+    focus: >-
+      Official university computer science artificial intelligence direct PhD
+      admission from Indian BTech 2027 guaranteed tuition waiver living stipend
+      funding duration eligibility; an alternative to a master's, not a master's
+      offer, and never assume leaving a PhD early yields a funded terminal MS
+    regions: [global]
+    audiences: [researchers]

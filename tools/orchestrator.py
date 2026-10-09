@@ -3422,10 +3422,14 @@ class TopicRun:
 class SnowballOrchestrator:
     MODES = ("auto", "gemini-bulk", "grok-xhigh", "local")
 
-    def __init__(self, cfg: Config, store: Store, mode: str = "auto", dry: bool = False) -> None:
+    def __init__(
+        self, cfg: Config, store: Store, mode: str = "auto", dry: bool = False,
+        topics_path: Path | None = None,
+    ) -> None:
         self.cfg, self.dry = cfg, dry
         self.store = store.snapshot() if dry else store
         self.mode = mode
+        self.topics_path = topics_path
         self.budget = TokenBudgetMiddleware(self.store, cfg)
         self.gemini = GeminiBulkExtractor(cfg, self.budget, dry)
         self.grok = GrokAdversarialVerifier(cfg, self.budget, dry)
@@ -3441,7 +3445,7 @@ class SnowballOrchestrator:
             import yaml
         except ImportError:
             return 0
-        path = topics_path or ROOT / "topics.yml"
+        path = topics_path or self.topics_path or ROOT / "topics.yml"
         if not path.exists():
             path = ROOT / "topics.example.yml"
         if not path.exists():
@@ -4849,7 +4853,9 @@ def main(argv: list[str] | None = None) -> int:
             store = Store.in_memory()
     else:
         store = Store.open(a.db)
-    orch = SnowballOrchestrator(cfg, store, mode=a.mode or cfg.mode, dry=a.dry_run)
+    orch = SnowballOrchestrator(
+        cfg, store, mode=a.mode or cfg.mode, dry=a.dry_run, topics_path=a.topics,
+    )
     if a.status:
         st = orch.status()
         if a.json:

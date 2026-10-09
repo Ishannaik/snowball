@@ -352,6 +352,33 @@ class Cli(unittest.TestCase):
             self.assertIn("would call: search", r.stdout)
             self.assertEqual(hashlib.sha256(db.read_bytes()).hexdigest(), before)
 
+    def test_run_once_researches_topic_from_explicit_configuration(self):
+        with tempfile.TemporaryDirectory() as td:
+            topics = Path(td) / "topics.yml"
+            topics.write_text(
+                "seeds:\n"
+                "  - id: funded-on-campus-masters\n"
+                "    family: opportunities\n"
+                "    focus: funded on-campus computer science masters\n"
+                "    regions: [global]\n"
+                "    audiences: [students]\n",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [
+                    sys.executable, str(ROOT / "snowball.py"), "run-once",
+                    "--topics", str(topics), "--topic", "funded-on-campus-masters",
+                    "--db", str(Path(td) / "research.db"), "--dry-run", "--json",
+                ],
+                capture_output=True, text=True, timeout=120,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            wave = json.loads(result.stdout)
+            self.assertEqual(
+                [topic["topic"] for topic in wave["topics"]],
+                ["funded-on-campus-masters"],
+            )
+
 
 class RuntimeBehaviorGates(unittest.TestCase):
     def setUp(self):

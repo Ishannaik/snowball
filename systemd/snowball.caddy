@@ -1,0 +1,20 @@
+# Oracle's tailnet address, not a public listener. DNS must be grey-cloud/DNS-only.
+# Add this site block to the existing Caddyfile; keep the existing global options.
+snowball.ishannaik.com {
+    bind 100.68.165.73
+    tls {
+        dns cloudflare {env.CF_API_TOKEN}
+        resolvers 1.1.1.1 1.0.0.1
+    }
+    header {
+        Strict-Transport-Security "max-age=31536000"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "no-referrer"
+        -Server
+    }
+    reverse_proxy 127.0.0.1:8989 {
+        # Preserve the dashboard's loopback Host/DNS-rebinding guard.
+        header_up Host 127.0.0.1:8989
+    }
+}

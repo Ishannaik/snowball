@@ -1,0 +1,22 @@
+[Unit]
+Description=Snowball consistent backup, retention, deadline expiry and integrity check
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/repos/snowball
+EnvironmentFile=-/home/ubuntu/.config/snowball/environment
+ExecStart=/home/ubuntu/repos/snowball/.venv/bin/python /home/ubuntu/repos/snowball/snowball.py retention --json
+MemoryMax=512M
+MemorySwapMax=0
+TimeoutStartSec=600
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/repos/snowball/data /home/ubuntu/repos/snowball/raw /home/ubuntu/repos/snowball/logs /home/ubuntu/repos/snowball/state
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=yes
+LockPersonality=yes

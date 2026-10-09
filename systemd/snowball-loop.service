@@ -1,18 +1,32 @@
 [Unit]
-Description=Research wiki non-stop loop (one topic per iteration, 5 min pause; touch STOP to pause)
-After=network-online.target
+Description=Snowball transactional research supervisor (touch STOP to pause)
+After=network-online.target snowball-tunnels.service
+Wants=snowball-tunnels.service
 
 [Service]
 Type=simple
+User=ubuntu
+Group=ubuntu
 WorkingDirectory=/home/ubuntu/repos/snowball
-Environment=PATH=/usr/local/bin:/usr/bin:/bin:/home/ubuntu/.local/bin
-ExecStart=/home/ubuntu/repos/snowball/loop.sh
+Environment=PATH=/home/ubuntu/repos/snowball/.venv/bin:/home/ubuntu/.bun/bin:/usr/local/bin:/usr/bin:/bin:/home/ubuntu/.local/bin
+EnvironmentFile=-/home/ubuntu/.config/snowball/environment
+ExecStart=/home/ubuntu/repos/snowball/.venv/bin/python /home/ubuntu/repos/snowball/snowball.py supervise --max-topics 1 --json
 Restart=always
 RestartSec=60
 MemoryMax=3G
 MemorySwapMax=0
 Nice=10
 KillMode=control-group
+TimeoutStopSec=15
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/repos/snowball/data /home/ubuntu/repos/snowball/raw /home/ubuntu/repos/snowball/wiki /home/ubuntu/repos/snowball/digests /home/ubuntu/repos/snowball/logs /home/ubuntu/repos/snowball/state
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=yes
+LockPersonality=yes
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target

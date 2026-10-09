@@ -1,8 +1,23 @@
 [Unit]
-Description=Research wiki daily Discord digest (last 24 h)
+Description=Snowball evidence-backed daily digest with confirmed acknowledgement
+After=network-online.target snowball-tunnels.service
 
 [Service]
 Type=oneshot
+User=ubuntu
+Group=ubuntu
 WorkingDirectory=/home/ubuntu/repos/snowball
-ExecStart=/usr/bin/python3 /home/ubuntu/repos/snowball/tools/digest.py --daily
-MemoryMax=200M
+EnvironmentFile=-/home/ubuntu/.config/snowball/environment
+ExecStart=/home/ubuntu/repos/snowball/.venv/bin/python /home/ubuntu/repos/snowball/snowball.py digest --post --json
+MemoryMax=256M
+MemorySwapMax=0
+TimeoutStartSec=180
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/repos/snowball/data /home/ubuntu/repos/snowball/digests /home/ubuntu/repos/snowball/logs
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=yes
+LockPersonality=yes

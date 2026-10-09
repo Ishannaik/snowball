@@ -3,7 +3,7 @@
 
 queue.py pick N                 print up to N "slug public|private" lines (queued first, else suggested)
 queue.py prompt SLUG OUT MIN    print the filled research prompt (env EXA_LEFT caps web_search calls)
-queue.py done SLUG REPORT       mark done, append up to 2 SUGGEST lines (max 3 new per day)
+queue.py done SLUG REPORT       mark done, append up to 2 SUGGEST lines (max 5 new per day)
 queue.py budget get             print today's budget counters as JSON
 queue.py budget add FIELD N     add N to a counter (topic_runs, exa, suggestions)
 """
@@ -129,6 +129,8 @@ def prompt(slug, out, minutes):
     t = find(load(), slug)
     text = (ROOT / "prompts/research.md").read_text()
     health = any(w in (t["title"] + t.get("focus", "")).lower() for w in ("tmj", "medical", "health", "jaw"))
+    # private marks the TMJ lane. The anecdote line must not depend on the title containing a health word.
+    anecdotal = bool(t.get("private")) or health
     fills = {
         "TITLE": t["title"],
         "FOCUS": " ".join((t.get("focus") or "").split()),
@@ -138,7 +140,7 @@ def prompt(slug, out, minutes):
         "OUT": out,
         "MINUTES": minutes,
         "FORUM_PY": str(ROOT / "tools/forum.py"),
-        "EXTRA": TMJ_EXTRA if health else "",
+        "EXTRA": TMJ_EXTRA if anecdotal else "",
         "EXA_LEFT": os.environ.get("EXA_LEFT", "10"),
     }
     for k, v in fills.items():
@@ -159,16 +161,19 @@ def done(slug, report):
         s, title = m.group(1), m.group(2)
         if s in known or added >= min(2, room):
             continue
-        d["topics"].append(
-            {
-                "slug": s,
-                "priority": 50,
-                "status": "suggested",
-                "title": title,
-                "focus": f"Follow-up suggested by the {slug} run on {t['last_run']}.",
-                "suggested_by": slug,
-            }
-        )
+        row = {
+            "slug": s,
+            "priority": 50,
+            "status": "suggested",
+            "title": title,
+            "focus": f"Follow-up suggested by the {slug} run on {t['last_run']}.",
+            "suggested_by": slug,
+        }
+        # A private run must not mint a public follow-up. pick() would otherwise
+        # print it as public and the research lane would leave the box.
+        if t.get("private"):
+            row["private"] = True
+        d["topics"].append(row)
         known.add(s)
         added += 1
     save(d)

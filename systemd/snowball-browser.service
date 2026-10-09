@@ -1,0 +1,24 @@
+[Unit]
+Description=Snowball one-shot challenge browser worker
+After=network-online.target
+# Bound by the snowball.service memory budget (supervisor MemoryMax=3G).
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+NetworkNamespacePath=/run/netns/snowball-browser
+WorkingDirectory=/home/ubuntu/repos/snowball
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 /home/ubuntu/repos/snowball/tools/browser_worker.py --serve
+MemoryMax=768M
+MemorySwapMax=0
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
+ReadWritePaths=/tmp
+IPAddressDeny=any
+IPAddressAllow=127.0.0.1
+
+[Install]
+WantedBy=default.target

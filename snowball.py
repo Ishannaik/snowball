@@ -1,14 +1,5 @@
 #!/usr/bin/env python3
-"""Snowball Unified CLI Dispatcher.
-Commands:
-  snowball run [--topic SLUG] [--max-topics N] [--dry-run] [--mode MODE]
-  snowball status [--json]
-  snowball ask "<question>" [--json] [--no-model]
-  snowball serve [--port PORT]
-  snowball visualize [--terminal] [--port PORT]
-  snowball digest [--post] [--channel ID]
-  snowball compile [--out DIR]
-"""
+"""Snowball CLI: research, local knowledge, delivery, and production diagnostics."""
 
 from __future__ import annotations
 
@@ -18,149 +9,143 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-PYTHON = sys.executable
 
 
 def run_cmd(args: list[str]) -> int:
-    """Execute python subprocess forwarding stdout/stderr."""
-    res = subprocess.run([PYTHON] + args, cwd=ROOT)
-    return res.returncode
+    """Use the active Python environment and preserve the worker's exit status."""
+    return subprocess.run([sys.executable, *args], cwd=ROOT).returncode
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(
-        prog="snowball",
-        description="Snowball: Autonomous 24/7 Deep Research Agent That Never Repeats Itself",
-    )
-    sub = ap.add_subparsers(dest="command", required=True)
+def add_storage(parser: argparse.ArgumentParser, *, wiki: bool = False) -> None:
+    parser.add_argument("--db", type=Path, help="SQLite database (default: data/snowball.db)")
+    if wiki:
+        parser.add_argument("--wiki", type=Path, help="Markdown knowledge directory (default: wiki)")
 
-    # 1. Run
-    p_run = sub.add_parser("run", help="Execute research crawl & extraction cycle")
-    p_run.add_argument("--topic", help="Target topic slug")
-    p_run.add_argument("--max-topics", type=int, default=2, help="Max topics per batch")
-    p_run.add_argument("--mode", choices=["auto", "gemini-bulk", "grok-xhigh", "local"], default="auto")
-    p_run.add_argument("--dry-run", action="store_true", help="Simulate without network calls")
 
-    # 2. Status
-    p_status = sub.add_parser("status", help="Print frontier health, token spend, and yield")
-    p_status.add_argument("--json", action="store_true", help="Output JSON")
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="snowball", description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+    for name, flag, description in (
+        ("run", None, "Run a research batch"),
+        ("run-once", "--run-once", "Run one wave and report its supervisor outcome"),
+        ("supervise", "--supervise", "Run the persistent, STOP-aware supervisor"),
+        ("seed", "--seed-only", "Seed the deterministic topic grid"),
+        ("status", "--status", "Read frontier health, spend, and supervisor state"),
+    ):
+        p = sub.add_parser(name, help=description)
+        p.set_defaults(worker="orchestrator.py", worker_flag=flag)
+        add_storage(p)
+        p.add_argument("--json", action="store_true")
+        if name != "status":
+            p.add_argument("--topics", type=Path, help="Topic configuration YAML")
+            p.add_argument("--dry-run", "--dryrun", action="store_true", help="In-memory run; no external calls or disk writes")
+        if name in ("run", "run-once", "supervise"):
+            p.add_argument("--topic", help="Target topic slug")
+            p.add_argument("--max-topics", type=int, default=1 if name != "run" else None)
+            p.add_argument("--mode", choices=["auto", "gemini-bulk", "grok-xhigh", "local"], help="Override configured extraction mode")
 
-    # 3. Ask
-    p_ask = sub.add_parser("ask", help="Query local knowledge base with verified citations")
-    p_ask.add_argument("query", help="Question or search query")
-    p_ask.add_argument("--json", action="store_true", help="Output raw facts JSON")
-    p_ask.add_argument("--no-model", action="store_true", help="Deterministic synthesis only")
+    p = sub.add_parser("ask", help="Answer from retrieved local Markdown with citations")
+    p.set_defaults(worker="ask.py", worker_flag=None)
+    p.add_argument("query")
+    add_storage(p, wiki=True)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--no-model", action="store_true")
+    p.add_argument("--limit", type=int, default=12)
 
-    # 4. Serve (Web Dashboard)
-    p_serve = sub.add_parser("serve", help="Launch interactive web dashboard & knowledge graph")
-    p_serve.add_argument("--port", type=int, default=8989, help="HTTP port (default: 8989)")
+    for name in ("serve", "visualize"):
+        p = sub.add_parser(name, help="View the read-only research dashboard")
+        p.set_defaults(worker="visualize.py", worker_flag="--serve" if name == "serve" else None)
+        add_storage(p)
+        p.add_argument("--port", type=int, default=8989)
+        p.add_argument("--host", default="127.0.0.1", help="Bind address; loopback by default")
+        if name == "visualize":
+            p.add_argument("--serve", action="store_true")
+            p.add_argument("--terminal", action="store_true")
 
-    # 5. Visualize
-    p_vis = sub.add_parser("visualize", help="Render terminal or web knowledge graph")
-    p_vis.add_argument("--terminal", action="store_true", help="ASCII terminal radar view")
-    p_vis.add_argument("--serve", action="store_true", help="Launch web server")
-    p_vis.add_argument("--port", type=int, default=8989, help="HTTP port (default: 8989)")
-
-    # 6. Digest
-    p_digest = sub.add_parser("digest", help="Compile daily opportunity digest")
-    p_digest.add_argument("--post", action="store_true", help="Send to Discord webhook/bot")
-    p_digest.add_argument("--channel", type=str, default="", help="Override Discord channel")
-
-    # 7. Compile
-    p_compile = sub.add_parser("compile", help="Compile Markdown knowledge base & entities")
-    p_compile.add_argument("--out", type=Path, default=ROOT / "wiki", help="Output wiki path")
-
-    # 8. Seed
-    p_seed = sub.add_parser("seed", help="Seed topic grid from topics.yml into database")
-    p_seed.add_argument("--dry-run", action="store_true", help="Print deterministic hashes without writing")
-
-    # 9. Reindex
-    sub.add_parser("reindex", help="Rebuild FTS5 search indexes from database and markdown")
-
-    # 10. Eval
-    p_eval = sub.add_parser("eval", help="Execute benchmark evaluation gates")
-    p_eval_sub = p_eval.add_subparsers(dest="eval_cmd", required=True)
-    p_ec = p_eval_sub.add_parser("classify", help="Evaluate classifier accuracy (>=85%)")
-    p_ec.add_argument("fixture", type=Path, help="Path to pages_labelled_50.jsonl")
-    p_ee = p_eval_sub.add_parser("extract", help="Evaluate extraction schema and quote fidelity (100%)")
-    p_ee.add_argument("fixture", type=Path, help="Path to items_20.jsonl")
-    p_ed = p_eval_sub.add_parser("digest", help="Audit quotes in recent digests")
-    p_ed.add_argument("--since", type=str, default="7d", help="Time window (default: 7d)")
-
-    parsed, remaining = ap.parse_known_args()
-
-    cmd = parsed.command
-    if cmd == "run":
-        argv = ["tools/orchestrator.py"]
-        if parsed.topic:
-            argv.extend(["--topic", parsed.topic])
-        if parsed.max_topics:
-            argv.extend(["--max-topics", str(parsed.max_topics)])
-        if parsed.mode:
-            argv.extend(["--mode", parsed.mode])
-        if parsed.dry_run:
-            argv.append("--dry-run")
-        argv.extend(remaining)
-        sys.exit(run_cmd(argv))
-
-    elif cmd == "status":
-        argv = ["tools/orchestrator.py", "--status"]
-        if parsed.json:
-            argv.append("--json")
-        sys.exit(run_cmd(argv))
-
-    elif cmd == "ask":
-        argv = ["tools/ask.py", parsed.query]
-        if parsed.json:
-            argv.append("--json")
-        if parsed.no_model:
-            argv.append("--no-model")
-        argv.extend(remaining)
-        sys.exit(run_cmd(argv))
-
-    elif cmd == "serve":
-        argv = ["tools/visualize.py", "--serve", "--port", str(parsed.port)]
-        sys.exit(run_cmd(argv))
-
-    elif cmd == "visualize":
-        argv = ["tools/visualize.py"]
-        if parsed.serve:
-            argv.extend(["--serve", "--port", str(parsed.port)])
-        elif parsed.terminal:
-            argv.append("--terminal")
+    for name in ("digest", "alerts"):
+        p = sub.add_parser(name, help="Prepare evidence-backed delivery; acknowledge only confirmed sends")
+        p.set_defaults(worker=f"{name}.py", worker_flag=None)
+        add_storage(p)
+        p.add_argument("--post", action="store_true")
+        p.add_argument("--channel", help="Explicit authorized Discord channel")
+        p.add_argument("--json", action="store_true")
+        if name == "digest":
+            p.add_argument("--day", help="IST date YYYY-MM-DD")
+            p.add_argument("--weekly", action="store_true")
         else:
-            argv.append("--terminal")
-        sys.exit(run_cmd(argv))
+            p.add_argument("--as-of", help="Evaluation timestamp")
 
-    elif cmd == "digest":
-        argv = ["tools/digest.py"]
-        if parsed.post:
-            argv.append("--post")
-        if parsed.channel:
-            argv.extend(["--channel", parsed.channel])
-        sys.exit(run_cmd(argv))
+    p = sub.add_parser("compile", help="Incrementally compile authoritative Markdown")
+    p.set_defaults(worker="wiki_compiler.py", worker_flag=None)
+    add_storage(p)
+    p.add_argument("--out", type=Path, default=ROOT / "wiki")
+    p.add_argument("--full", action="store_true")
+    p.add_argument("--json", action="store_true")
 
-    elif cmd == "compile":
-        argv = ["tools/wiki_compiler.py", "--out", str(parsed.out)]
-        sys.exit(run_cmd(argv))
-    elif cmd == "seed":
-        argv = ["tools/orchestrator.py", "--seed-only"]
-        if parsed.dry_run:
-            argv.append("--dry-run")
-        sys.exit(run_cmd(argv))
+    p = sub.add_parser("reindex", help="Rebuild knowledge caches from Markdown, including human edits")
+    p.set_defaults(worker="eval_gates.py", worker_flag="reindex")
+    add_storage(p, wiki=True)
+    p.add_argument("--json", action="store_true")
 
-    elif cmd == "reindex":
-        argv = ["tools/eval_gates.py", "reindex"]
-        sys.exit(run_cmd(argv))
+    p = sub.add_parser("retention", help="Prune expired raw/logs and create or restore a consistent backup")
+    p.set_defaults(worker="retention.py", worker_flag=None)
+    add_storage(p)
+    p.add_argument("--root", type=Path, default=ROOT)
+    p.add_argument("--restore", type=Path, help="Backup to restore into the selected isolated --db")
+    p.add_argument("--keep", type=int, default=7)
+    p.add_argument("--json", action="store_true")
 
-    elif cmd == "eval":
-        argv = ["tools/eval_gates.py", parsed.eval_cmd]
-        if parsed.eval_cmd in ("classify", "extract"):
-            argv.append(str(parsed.fixture))
-        elif parsed.eval_cmd == "digest":
-            argv.extend(["--since", parsed.since])
-        sys.exit(run_cmd(argv))
+    p = sub.add_parser("feedback", help="Ingest authorized, deduplicated reaction events")
+    p.set_defaults(worker="feedback.py", worker_flag=None)
+    add_storage(p)
+    p.add_argument("--event-json", help="Reaction event JSON or a file containing it")
+    p.add_argument("--item-id", help="Delivered item identifier")
+    p.add_argument("--reaction", choices=["up", "down"])
+    p.add_argument("--json", action="store_true")
+
+    for name in ("diagnostics", "access-diagnose"):
+        p = sub.add_parser(name, help="Check production readiness; blocked prerequisites return nonzero")
+        p.set_defaults(worker="eval_gates.py", worker_flag="diagnostics")
+        add_storage(p, wiki=True)
+        p.add_argument("--json", action="store_true")
+        p.add_argument("--live", action="store_true", help="Run authenticated provider diagnostics")
+
+    p = sub.add_parser("eval", help="Evaluate production behavior; empty samples never pass")
+    eval_sub = p.add_subparsers(dest="eval_cmd", required=True)
+    for name in ("classify", "extract", "topics", "digest"):
+        ep = eval_sub.add_parser(name)
+        ep.set_defaults(worker="eval_gates.py", worker_flag=name)
+        add_storage(ep)
+        ep.add_argument("--json", action="store_true")
+        if name == "digest":
+            ep.add_argument("--since", default="7d", help="Audit window, e.g. 7d")
+        else:
+            ep.add_argument("fixture", type=Path)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    forwarded = [str(ROOT / "tools" / args.worker)]
+    if args.worker_flag:
+        forwarded.append(args.worker_flag)
+    if args.command == "ask":
+        forwarded.append(args.query)
+    elif args.command == "eval" and args.eval_cmd != "digest":
+        forwarded.append(str(args.fixture))
+    for field in (
+        "db", "wiki", "topics", "topic", "max_topics", "mode", "limit", "port", "host",
+        "channel", "day", "as_of", "out", "root", "restore", "keep", "event_json",
+        "item_id", "reaction", "since",
+    ):
+        value = getattr(args, field, None)
+        if value is not None:
+            forwarded.extend(["--" + field.replace("_", "-"), str(value)])
+    for field in ("json", "dry_run", "no_model", "serve", "terminal", "post", "weekly", "full", "live"):
+        if getattr(args, field, False):
+            forwarded.append("--" + field.replace("_", "-"))
+    return run_cmd(forwarded)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

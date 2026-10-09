@@ -1,0 +1,17 @@
+[Unit]
+Description=Snowball browser egress check
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/ubuntu/repos/snowball
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 /home/ubuntu/repos/snowball/tools/browser_worker.py --check-egress
+MemoryMax=128M
+MemorySwapMax=0
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target

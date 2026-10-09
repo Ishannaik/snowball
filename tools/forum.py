@@ -9,7 +9,7 @@ with a source URL and a date on every item, so the agent can cite without guessi
   forum.py hn-item <id>                        # story + top comments
   forum.py gh-search "query" [--discussions]
   forum.py discourse <host> "query"           # e.g. discuss.huggingface.co
-  forum.py fetch <url> [--camoufox]           # page text; Camoufox only for Cloudflare walls
+  forum.py fetch <url> [--camoufox]           # free-path text; Camoufox is not a second access policy
 
 Stdlib only. Every network call has a timeout. Errors print one line and exit 1.
 """
@@ -17,13 +17,32 @@ Stdlib only. Every network call has a timeout. Errors print one line and exit 1.
 import argparse
 import datetime as dt
 import html
+import importlib.util
 import json
+from pathlib import Path
 import re
 import subprocess
 import sys
 import urllib.parse
 import urllib.request
 
+_TOOLS_DIR = Path(__file__).resolve().parent
+
+
+def _load(mod_name: str, filename: str):
+    existing = sys.modules.get(mod_name)
+    if existing is not None:
+        return existing
+    spec = importlib.util.spec_from_file_location(mod_name, _TOOLS_DIR / filename)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+guard = _load("snowball_egress_guard", "egress_guard.py")
 UA = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0 snowball/0.1"
 ARCTIC = "https://arctic-shift.photon-reddit.com"
 MAX_BODY = 600  # chars per post/comment body shown to the agent
@@ -206,36 +225,53 @@ def discourse(a):
 
 
 def fetch(a):
+    # Free direct read. DNS pinned via guard.validate_target; no TOCTOU rebinding.
+    # Camoufox below is legacy/inherited and is not a second access policy; fail-closed is enforced.
+    # It does not authorize login, paywall, robots, or ban bypass.
+    if guard is not None:
+        try:
+            pinned = guard.validate_target(a.url)
+        except Exception as exc:
+            sys.exit(f"fetch error: egress denied: {exc}")
+    else:
+        sys.exit("fetch error: egress guard unavailable")
+
     if not a.camoufox:
         try:
-            req = urllib.request.Request(a.url, headers={"User-Agent": UA})
-            with urllib.request.urlopen(req, timeout=45) as r:
-                raw = r.read(3_000_000).decode("utf-8", "replace")
+            # Pinned fetch via curl_cffi with CURLOPT_RESOLVE to prevent TOCTOU rebinding
+            try:
+                from curl_cffi import CurlOpt, requests as cffi
+                s = cffi.Session(impersonate="chrome")
+                s.curl.setopt(CurlOpt.RESOLVE, [f"{pinned.host}:{pinned.port}:{pinned.ip}"])
+                resp = s.get(
+                    a.url,
+                    allow_redirects=False,
+                    timeout=45,
+                    headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"},
+                )
+                status_code = resp.status_code
+                raw = resp.text
+            except ImportError:
+                req = urllib.request.Request(a.url, headers={"User-Agent": UA})
+                with urllib.request.urlopen(req, timeout=45) as r:
+                    status_code = r.status
+                    raw = r.read(3_000_000).decode("utf-8", "replace")
+
+            if status_code in (403, 503):
+                sys.exit(f"fetch error: HTTP {status_code} (access denied; policy prohibits automatic bypass)")
+            if status_code >= 400:
+                sys.exit(f"fetch error: HTTP {status_code}")
+
             raw = re.sub(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>", " ", raw)
             print(clip(re.sub(r"<[^>]+>", " ", raw), a.chars))
             return
-        except urllib.error.HTTPError as e:
-            if e.code not in (403, 503):
-                sys.exit(f"fetch error: HTTP {e.code}")
-            print(f"(HTTP {e.code}, retrying with Camoufox)", file=sys.stderr)
-        except Exception as e:  # noqa: BLE001 - one-line error for the agent
+        except Exception as e:
             sys.exit(f"fetch error: {e}")
-    # Camoufox for Cloudflare walls only. The context manager closes the browser on every path.
-    code = (
-        "import sys\nfrom camoufox.sync_api import Camoufox\n"
-        "with Camoufox(headless=True, geoip=True) as b:\n"
-        "    p = b.new_page(); p.goto(sys.argv[1], wait_until='domcontentloaded', timeout=60000)\n"
-        "    p.wait_for_timeout(6000); print(p.inner_text('body')[:int(sys.argv[2])])\n"
-    )
-    r = subprocess.run(
-        ["/home/ubuntu/.venv-camoufox/bin/python", "-c", code, a.url, str(a.chars)],
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-    print(r.stdout if r.returncode == 0 else f"camoufox error: {r.stderr.strip()[-300:]}")
 
-
+    # Explicit legacy Camoufox flag requested by operator:
+    # Under active access policy, legacy second bypass is disabled until owned challenge gates pass.
+    # Fail closed to ensure no unisolated bypass policy survives.
+    sys.exit("camoufox error: legacy bypass policy disabled under active access policy")
 def main():
     ap = argparse.ArgumentParser()
     sp = ap.add_subparsers(dest="cmd", required=True)

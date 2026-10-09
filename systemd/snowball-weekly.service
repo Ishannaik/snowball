@@ -1,0 +1,23 @@
+[Unit]
+Description=Snowball once-only evidence-backed weekly learning briefing
+After=network-online.target snowball-tunnels.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/repos/snowball
+EnvironmentFile=-/home/ubuntu/.config/snowball/environment
+ExecStart=/home/ubuntu/repos/snowball/.venv/bin/python /home/ubuntu/repos/snowball/snowball.py digest --weekly --post --json
+MemoryMax=256M
+MemorySwapMax=0
+TimeoutStartSec=180
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/repos/snowball/data /home/ubuntu/repos/snowball/digests /home/ubuntu/repos/snowball/logs
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=yes
+LockPersonality=yes

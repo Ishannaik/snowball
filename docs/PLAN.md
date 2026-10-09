@@ -2,6 +2,33 @@
 
 Written 2026-10-04. The crawl logic itself is in [DESIGN.md](DESIGN.md), and the outside projects we borrow from are in [FEATURE_MATRIX.md](FEATURE_MATRIX.md).
 
+## Current policy and gate status (2026-10-08)
+
+[SYSTEM_DESIGN.md](SYSTEM_DESIGN.md) is the current policy. This file keeps the original feature list. Section 1's non-goals and row B3 are the amended access text. Invariant I4 in SYSTEM_DESIGN is the access rule. Row I4 in the ops table below is retention. Those are different I4s.
+
+Access amendment: configured managed fetch, residential proxy, and a CAPTCHA provider may read operator-approved public pages. Escalation is domain-scoped, cost-capped, and time-bounded. Login, paywall, robots exclusions, explicit access denials, and rate-limit bans do not escalate. Public-page access does not authorize login bypass, paywall bypass, purchase or application actions, credential use on the target, or identity rotation through a ban. Private topics stay on local models. Evidence quotes, tool-free models, and code-generated queries stay in force.
+
+Feature implementation is the code path. Provider activation is credentials, a current tariff, nonzero ceilings, and an `access.yml` allowlist. Shipped secret-free ceilings stay at zero. A missing key is `blocked`, not a pass. Spend is integer micro-USD. Proxy traffic is integer bytes. Provider-specific units are not added to either. The old ZenRows 1/5/10/25 credit table is not a current tariff.
+
+Gate completion is a verified row in `data/gate-evidence.jsonl` (`fixture_verified`, `live_verified`, or `soak_verified`) with `gate_id`, `command`, `exit_code`, `started_at`, `finished_at`, and a redacted `evidence_path`. `implemented` and `blocked` are not verified. The original Fable list is 44 gates (M0.01, M1.01–M1.12, M2.01–M2.12, M3.01–M3.11, M4.01–M4.08). Access gates A01–A15 are additional. The baseline unit discovery on this worktree is 60 tests. That run is not the ledger. An existing git tag is not the ledger.
+
+Evaluator and production paths differ. T0 does not implement the missing runtime.
+
+- Classifier: `tools/eval_gates.py` `classify_heuristic` is not the fetch pipeline. Owners T5 and T10. Regression `classifier-not-production` blocks M2.01.
+- Extractor: `eval_extract` scores quotes already on fixture rows. Owners T5 and T10. Regression `extractor-not-production` blocks M2.02.
+- Digest audit: `eval_digest` accepts quote length over 10 characters and sets the pass flag on 0 quotes. The observed result is 0/0 with the pass flag set. Owner T10. Regressions `digest-eval-zero-over-zero` and `digest-quote-length` block M4.08.
+- Delivery: resolved in code (`tools/digest.py`). `compile_daily_digest` does not set `reported_at`; `reported_at` is written only by `acknowledge_digest` after confirmed Discord delivery.
+- Reindex: an empty `reindex_fts` does not prove M2.12. Owner T8. Regression `empty-reindex`.
+- Slug: six examples are not the 10,000-string property gate. Owner T5. Regression `slug-sample-not-property` blocks M1.10.
+
+Plan baseline observed 2026-10-08, not a deployment measurement:
+
+- A live isolated cloud-credit run fetched two official pages with HTTP 200. Google yielded one verified entity and three committed claims. AWS extraction received a model 503 and stayed pending. The entity link was null. X search cleanup failed on Windows at `os.killpg`.
+- Oracle and goku had no installed Snowball user units. The configured adapter on 8812 was unreachable. Historical free-memory and free-disk figures in section 3 are not deployment evidence.
+- The digest unit command passed an unsupported `--daily`. In current code, `compile_daily_digest` leaves rows unreported; `reported_at` requires delivery acknowledgement.
+- `tests/test_fable_gates.py` does not execute the 44 gates. Paid fetching, hub diffs, refill, drift enforcement, incremental dirty/stale compilation, retention, feedback, and urgent alerts still need their owners.
+- The inherited `tools/forum.py` Camoufox path is outside the active orchestrator. It is not a second access policy and it is not the Turnstile or reCAPTCHA solver. It stays until owned challenge fixtures pass. T0 does not switch that runtime on.
+
 ## 1. What we want
 
 A research agent that runs 24/7 and never stops digging.
@@ -12,7 +39,7 @@ A research agent that runs 24/7 and never stops digging.
 **Done looks like this:** every morning one Discord digest, "N new findings, M worth your time". Every item in it has a link and a reason. Asking it "what do we know about X" answers from the library in seconds.
 
 **Non-goals:**
-- **No walls.** It does not solve captchas, bypass bot walls, log in or fill in forms.
+- **Authorized public access only.** Login, paywall, robots, explicit denial, and rate-limit bans stop escalation. Supported public challenges on an `access.yml` origin may use one bounded managed, residential, or solver step after provider activation. That is not a bypass, and the code path is not activation.
 - **No restricted sources.** It does not crawl leak, warez or credential sites.
 - **No acting on findings.** It does not apply for anything or post anything.
 - **No approval queue.** It grows by itself. Human feedback is optional and only adjusts scores.
@@ -36,7 +63,7 @@ P0 is the first cut, P1 comes next, P2 is later. Each feature has a test that pr
 |---|---|---|---|
 | B1 | Router: Reddit to Arctic Shift, GitHub to the API, HN to Algolia, X to grok, everything else to fetch | P0 | Each source type hits its route |
 | B2 | Cheapest first: RSS/sitemap/API, then plain GET, then Exa contents | P0 | Logs show the route used per fetch |
-| B3 | Walls: login, captcha, Cloudflare challenge or robots disallow means mark the page `walled` and skip. Never retry with tricks | P0 | Challenge page is marked, never retried |
+| B3 | Walls: login, paywall, robots, or an explicit denial stops escalation. A supported public challenge on an approved origin may take one bounded chain after provider activation. HTTP 429 cools down and does not rotate identity. | P0 | Excluded domain makes no paid call. Approved challenge is one chain, then no re-acquisition for 24 h. |
 | B4 | 3 strikes then dead; 429 pauses the domain and does not count as a strike | P0 | Rate limit does not kill a good domain |
 | B5 | Exa key pool via the rotator (:8791), with a live-key floor | P0 (exists) | Pool exhaustion pauses search, fetch continues |
 | B6 | grok X search with post-date validation; kill the process after output | P1 | Fabricated or out-of-window posts rejected |
@@ -134,7 +161,7 @@ seeds (topics.yml) -> grid.py --------------------+
 - `domains(domain, junk, yield, walled, blocked)`
 - `runs(id, step, started, ended, tokens, exa_calls)`
 
-**Where it runs:** goku (4 ARM cores, 11 GB free RAM, 98 GB free disk). Oracle's disk is 97% full, so Oracle is out.
+**Where it runs:** production state belongs on goku. Oracle supplies model and Exa services and does not hold Snowball state. The 2026-10-04 note "4 ARM cores, 11 GB free RAM, 98 GB free disk" and "Oracle's disk is 97% full" is a historical measurement, not deployment evidence. Measure the host again at deployment.
 - **LLM:** the qwen proxy over the tailnet. The proxy currently listens only on Oracle's localhost, so goku needs a key-gated tailnet listener.
 - **Embeddings:** a small CPU model on goku, e.g. bge-small via ONNX, about 150 MB RAM. We have not confirmed that the proxy serves embeddings; `/v1/embeddings` did not answer on Oracle.
 

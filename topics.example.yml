@@ -1,14 +1,61 @@
 # Seed topics. Snowball grows this list by itself from what it reads.
 # Copy to topics.yml. Families set the re-check timer and the drift guard.
 families:
-  opportunities: {recheck_days: 14}
-  competitors: {recheck_days: 30}
-  alpha: {recheck_days: 1}
+  opportunities:
+    recheck_days: 14
+    weight: 1.0
+    relevance_floor: 0.08
+    focus: "non-dilutive grants, fellowships, credits and programs open to software founders"
+  competitors:
+    recheck_days: 30
+    weight: 0.8
+    relevance_floor: 0.08
+    focus: "competing products, launches, features and pricing"
+  alpha:
+    recheck_days: 1
+    weight: 1.2
+    relevance_floor: 0.08
+    focus: "new AI tools, models and infrastructure tricks before they are widely known"
+
 seeds:
-  - {id: startup-grants, family: opportunities, focus: "non-dilutive grants and programs open to early-stage software founders in India and the UAE"}
-  - {id: scholarships, family: opportunities, focus: "scholarships and fellowships for developers and students, open now"}
-  - {id: research-grants, family: opportunities, focus: "research and open-source grants (foundations, protocol grants, OSS funds)"}
-  - {id: hackathons, family: opportunities, focus: "online hackathons with cash prizes, open to India-based participants"}
-  - {id: free-credits, family: opportunities, focus: "free cloud, GPU and API credit programs and startup perks"}
-  - {id: competitors, family: competitors, focus: "products competing with our projects; pricing, launches, gaps"}
-  - {id: alpha-news, family: alpha, focus: "new AI tools, models and infra tricks before they are widely known"}
+  - id: startup-grants
+    family: opportunities
+    focus: "non-dilutive grants and programs open to early-stage software founders in India and the UAE"
+    regions: ["india", "uae", "global"]
+    audiences: ["developers", "startups"]
+
+  - id: scholarships
+    family: opportunities
+    focus: "scholarships and fellowships for developers and students, open now"
+    regions: ["india", "global"]
+    audiences: ["students", "developers"]
+
+  - id: research-grants
+    family: opportunities
+    focus: "research and open-source grants (foundations, protocol grants, OSS funds)"
+    regions: ["global"]
+    audiences: ["researchers", "developers"]
+
+  - id: hackathons
+    family: opportunities
+    focus: "online hackathons with cash prizes, open to India-based participants"
+    regions: ["india", "global"]
+    audiences: ["developers", "students"]
+
+  - id: free-credits
+    family: opportunities
+    focus: "free cloud, GPU and API credit programs and startup perks"
+    regions: ["global", "india"]
+    audiences: ["startups", "developers"]
+
+  - id: competitors
+    family: competitors
+    focus: "products competing with our projects; pricing, launches, gaps"
+    regions: ["global"]
+    audiences: ["startups"]
+
+  - id: alpha-news
+    family: alpha
+    focus: "new AI tools, models and infra tricks before they are widely known"
+    regions: ["global"]
+    audiences: ["developers", "researchers"]

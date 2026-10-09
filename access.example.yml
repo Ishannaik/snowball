@@ -1,0 +1,97 @@
+# Secret-free access policy. Paid ceilings stay at zero until an operator sets
+# canary limits outside this file, after tariffs and domain approval exist.
+# Unknown domains receive free public fetch only. They never enter paid or solver.
+# Editing this file changes its hash and drops cached policy objects and sessions.
+
+version: 1
+
+unknown_domains:
+  modes: [public]
+
+# These barriers never escalate to paid fetching or a solver.
+# Public fetch does not authorize login bypass, paywall bypass, robots evasion, or ban evasion.
+terminal_walls:
+  - login
+  - paywall
+  - generic_401
+  - generic_403
+  - generic_407
+  - generic_451
+  - "429"
+  - ban
+  - robots
+
+# Generic HTTP denials are not authorized challenges. 403 stays generic_403.
+terminal_statuses:
+  "401": generic_401
+  "403": generic_403
+  "407": generic_407
+  "429": "429"
+  "451": generic_451
+
+recognized_challenges:
+  - challenge_turnstile
+  - challenge_recaptcha
+
+# Zero ceilings. A positive tariff with a zero cap still refuses the route.
+# Unsettled reservations keep their worst-case micro-USD until settlement.
+budgets:
+  daily_micro_usd: 0
+  monthly_micro_usd: 0
+  daily_retrieval_count: 0
+  daily_solver_count: 0
+  monthly_solver_count: 0
+  tariffs:
+    zenrows: 0
+    residential: 0
+    captcha: 0
+  providers:
+    zenrows:
+      daily_micro_usd: 0
+      monthly_micro_usd: 0
+      daily_count: 0
+      monthly_count: 0
+    residential:
+      daily_micro_usd: 0
+      monthly_micro_usd: 0
+      daily_count: 0
+      monthly_count: 0
+    captcha:
+      daily_micro_usd: 0
+      monthly_micro_usd: 0
+      daily_count: 0
+      daily_solver_count: 0
+      monthly_solver_count: 0
+
+domains:
+  # Paid ZenRows and an authorized solver, limited to these path prefixes.
+  - origin: https://grants.example.org
+    path_prefixes:
+      - /opportunities/
+      - /programs/
+    resource_origins:
+      - https://challenges.cloudflare.com
+      - https://www.google.com/recaptcha/
+    modes: [public, paid, solver]
+    zenrows: true
+    challenges:
+      - challenge_turnstile
+      - challenge_recaptcha
+
+  # Paid ZenRows on an exact path, with no solver configured.
+  - origin: https://news.example.org
+    path_prefixes:
+      - /stories/
+    resource_origins: []
+    modes: [public, paid]
+    zenrows: true
+    challenges: []
+
+  # Free public documents. ZenRows is off even on the approved prefix.
+  - origin: https://docs.example.org
+    path_prefixes:
+      - /research/
+    resource_origins: []
+    modes: [public]
+    zenrows: false
+    challenges: []

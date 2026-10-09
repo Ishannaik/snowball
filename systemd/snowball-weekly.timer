@@ -1,0 +1,10 @@
+[Unit]
+Description=Snowball weekly briefing on Sunday at 09:00 IST
+
+[Timer]
+OnCalendar=Sun *-*-* 09:00:00 Asia/Kolkata
+Persistent=true
+Unit=snowball-weekly.service
+
+[Install]
+WantedBy=timers.target

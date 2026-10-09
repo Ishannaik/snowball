@@ -1,0 +1,11 @@
+[Unit]
+Description=Snowball nightly backup and retention at 02:30 IST
+
+[Timer]
+OnCalendar=*-*-* 02:30:00 Asia/Kolkata
+Persistent=true
+RandomizedDelaySec=60
+Unit=snowball-retention.service
+
+[Install]
+WantedBy=timers.target

@@ -57,7 +57,6 @@ import math
 import os
 import re
 import secrets
-import signal
 import socket
 import sqlite3
 import subprocess
@@ -109,14 +108,24 @@ def _sibling(name: str) -> Any:
     stdlib queue module, which concurrent.futures needs (AttributeError: no SimpleQueue)."""
     import importlib.util
 
-    spec = importlib.util.spec_from_file_location(f"snowball_{name}", ROOT / "tools" / f"{name}.py")
+    mod_name = f"snowball_{name}"
+    spec = importlib.util.spec_from_file_location(mod_name, ROOT / "tools" / f"{name}.py")
     mod = importlib.util.module_from_spec(spec)
+    # Register before exec so dataclass processing can see the module (Python 3.13).
+    sys.modules[mod_name] = mod
     spec.loader.exec_module(mod)
     return mod
 
 
 quarantine = _sibling("quarantine")
 sanitizer = _sibling("sanitizer")
+process_control = _sibling("process_control")
+access_policy = _sibling("access_policy")
+paid_fetch = _sibling("paid_fetch")
+fetch_types = _sibling("fetch_types")
+FetchResult = fetch_types.FetchResult
+SearchHit = fetch_types.SearchHit
+AccessRequest = fetch_types.AccessRequest
 SecurityIncident = getattr(sanitizer, "SecurityIncident", Exception)
 
 DB_PATH = ROOT / "data/snowball.db"
@@ -124,7 +133,7 @@ RAW_DIR = ROOT / "raw"
 STOP_FILE = ROOT / "STOP"
 ORNITH_LOCK = ROOT / "ornith.lock"
 IST = timezone(timedelta(hours=5, minutes=30))
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "3"
 ORCH_SCHEMA_VERSION = "1"
 
 
@@ -166,6 +175,11 @@ class Config:
     gemini_pro_model: str = "gemini-3.1-pro"
     gemini_max_input_chars: int = 3_000_000
     gemini_api_key: str | None = None
+    gemini_transport: str = "api"
+    ssh_model_host: str = "oracle"
+    ssh_omp_bin: str = "/usr/local/bin/omp"
+    ssh_timeout_sec: int = 120
+    exa_rotator_url: str = "http://127.0.0.1:8791"
     grok_verifier_model: str = "xai-oauth/grok-4.7"
     grok_reasoning_effort: str = "xhigh"
     grok_verify_timeout_sec: int = 900
@@ -174,7 +188,7 @@ class Config:
     grok_x_poll_sec: int = 180
     grok_x_window_days: int = 30
     omp_bin: str = "/usr/local/bin/omp"
-    local_base_url: str = "http://127.0.0.1:8812/v1"
+    local_base_url: str = "http://127.0.0.1:8800/v1"
     local_model: str = "ornith-1.5-35b-a3b-abliterated"
     local_fallback_model: str = "qwen3.8-27b-abliterated"
     local_api_key: str | None = None
@@ -193,10 +207,23 @@ class Config:
     kb_answer_min_claims: int = 5
     india_check: bool = True
     gh_token: str | None = None
+    paid_provider: str = ""
+    zenrows_mode: str = "auto"
+    zenrows_api_key: str | None = None
+    residential_proxy_url: str | None = None
+    paid_min_yield: float = 0.30
+    max_proxy_bytes: int = 20_971_520
+    max_paid_retrievals: int = 2
+    challenge_fixture: bool = False
+    captcha_api_key: str | None = None
+    captcha_deadline_sec: int = 120
+    discord_channel_id: str | None = None
 
 
 def load_config() -> Config:
-    env = {**_read_env_file(ROOT / "config.env"), **_read_env_file(ROOT / ".env"), **os.environ}
+    ext_env_path = os.environ.get("SNOWBALL_ENV_FILE")
+    ext_env = _read_env_file(Path(ext_env_path)) if ext_env_path else {}
+    env = {**_read_env_file(ROOT / "config.env"), **_read_env_file(ROOT / ".env"), **ext_env, **os.environ}
     env.pop("OPENROUTER_API_KEY", None)  # standing rule: never a model backend (spent cap, every call 429s)
 
     def gi(k: str, d: int) -> int:
@@ -221,9 +248,14 @@ def load_config() -> Config:
     c.grok_x_model = env.get("GROK_X_MODEL", c.grok_x_model)
     c.grok_x_poll_sec = gi("GROK_X_POLL_SEC", c.grok_x_poll_sec)
     c.grok_x_window_days = gi("GROK_X_WINDOW_DAYS", c.grok_x_window_days)
+    c.gemini_transport = env.get("GEMINI_TRANSPORT", c.gemini_transport).strip().lower()
+    c.ssh_model_host = env.get("SSH_MODEL_HOST", env.get("GEMINI_SSH_HOST", c.ssh_model_host))
+    c.ssh_omp_bin = env.get("SSH_OMP_BIN", c.ssh_omp_bin)
+    c.ssh_timeout_sec = gi("SSH_TIMEOUT_SEC", c.ssh_timeout_sec)
+    c.exa_rotator_url = env.get("EXA_ROTATOR_URL", c.exa_rotator_url).rstrip("/")
     c.omp_bin = env.get("OMP_BIN", c.omp_bin)
     if not Path(c.omp_bin).exists():
-        c.omp_bin = shutil.which("omp") or c.omp_bin
+        c.omp_bin = shutil.which("omp") or (str(Path.home() / ".bun/bin/omp") if (Path.home() / ".bun/bin/omp").exists() else c.omp_bin)
     c.local_base_url = env.get("OPENAI_BASE_URL", c.local_base_url).rstrip("/")
     c.local_model = env.get("LOCAL_MODEL", c.local_model)
     c.local_fallback_model = env.get("LOCAL_FALLBACK_MODEL", c.local_fallback_model)
@@ -246,6 +278,19 @@ def load_config() -> Config:
     c.collector_concurrency = gi("COLLECTOR_CONCURRENCY", c.collector_concurrency)
     c.domain_rate_per_min = gi("DOMAIN_RATE_PER_MIN", c.domain_rate_per_min)
     c.max_body_bytes = gi("MAX_BODY_BYTES", c.max_body_bytes)
+    c.paid_provider = (env.get("ACCESS_PAID_PROVIDER") or "").strip().lower()
+    c.zenrows_mode = (env.get("ZENROWS_MODE") or "auto").strip().lower()
+    c.zenrows_api_key = env.get("ZENROWS_API_KEY") or None
+    c.residential_proxy_url = env.get("RESIDENTIAL_PROXY_URL") or None
+    try:
+        c.paid_min_yield = float(env.get("PAID_FETCH_MIN_YIELD_SCORE", c.paid_min_yield))
+    except (TypeError, ValueError):
+        c.paid_min_yield = 0.30
+    c.max_proxy_bytes = gi("MAX_PROXY_BYTES_PER_ACQUISITION", c.max_proxy_bytes)
+    c.max_paid_retrievals = gi("MAX_PAID_RETRIEVALS_PER_ACQUISITION", c.max_paid_retrievals)
+    c.challenge_fixture = (env.get("SNOWBALL_CHALLENGE_FIXTURE") or "0").strip() == "1"
+    c.captcha_api_key = env.get("CAPTCHA_API_KEY") or None
+    c.captcha_deadline_sec = gi("CAPTCHA_DEADLINE_SEC", c.captcha_deadline_sec)
     c.kb_answer_min_claims = gi("KB_ANSWER_MIN_CLAIMS", c.kb_answer_min_claims)
     c.india_check = env.get("INDIA_ELIGIBILITY_CHECK", "1") != "0"
     c.gh_token = env.get("GH_TOKEN") or None
@@ -255,6 +300,335 @@ def load_config() -> Config:
     return c
 
 
+def diagnose_providers(cfg: Config, live: bool = False) -> dict[str, Any]:
+    """Perform authenticated availability checks and bounded completions for configured model IDs and Exa.
+    Missing credentials, unavailable tunnels, or floor drops are explicit blockers or failures.
+    """
+    res: dict[str, Any] = {}
+
+    # 1. Gemini
+    transport = getattr(cfg, "gemini_transport", "api")
+    if transport == "ssh-omp":
+        ssh_bin = shutil.which("ssh")
+        if not ssh_bin:
+            res["gemini"] = {"status": "blocked", "transport": "ssh-omp", "error": "ssh binary not found"}
+        else:
+            try:
+                test_cmd = [
+                    "ssh",
+                    cfg.ssh_model_host,
+                    "systemd-run",
+                    "--user",
+                    "--scope",
+                    "-p",
+                    "MemoryMax=3G",
+                    cfg.ssh_omp_bin,
+                    "-p",
+                    "--model",
+                    cfg.gemini_model,
+                    "--no-tools",
+                    "--no-session",
+                    "--no-extensions",
+                    "--no-title",
+                ]
+                if live:
+                    p = subprocess.run(
+                        test_cmd,
+                        input="Respond with exactly 'GEMINI_OK'.",
+                        capture_output=True,
+                        text=True,
+                        timeout=cfg.ssh_timeout_sec,
+                    )
+                    if p.returncode == 0 and "GEMINI_OK" in p.stdout:
+                        res["gemini"] = {"status": "ok", "transport": "ssh-omp", "model": cfg.gemini_model, "host": cfg.ssh_model_host}
+                    else:
+                        res["gemini"] = {"status": "error", "transport": "ssh-omp", "error": (p.stderr or p.stdout)[-300:]}
+                else:
+                    p = subprocess.run(["ssh", cfg.ssh_model_host, "true"], capture_output=True, timeout=10)
+                    if p.returncode == 0:
+                        res["gemini"] = {"status": "ok", "transport": "ssh-omp", "model": cfg.gemini_model, "host": cfg.ssh_model_host}
+                    else:
+                        res["gemini"] = {"status": "error", "transport": "ssh-omp", "error": (p.stderr or "")[-300:]}
+            except Exception as e:
+                res["gemini"] = {"status": "error", "transport": "ssh-omp", "error": str(e)[:300]}
+    elif transport == "omp":
+        resolved_omp = shutil.which(cfg.omp_bin) or (cfg.omp_bin if Path(cfg.omp_bin).exists() else None)
+        if not resolved_omp:
+            res["gemini"] = {"status": "blocked", "transport": "omp", "error": f"omp binary not found at {cfg.omp_bin}"}
+        else:
+            res["gemini"] = {"status": "ok", "transport": "omp", "binary": resolved_omp, "model": cfg.gemini_model}
+    else:  # "api"
+        if not cfg.gemini_api_key:
+            res["gemini"] = {"status": "blocked", "transport": "api", "model": cfg.gemini_model, "error": "GEMINI_API_KEY not configured"}
+        else:
+            try:
+                url = f"{cfg.gemini_endpoint}/{cfg.gemini_model}:generateContent"
+                body = {
+                    "contents": [{"role": "user", "parts": [{"text": "ping"}]}],
+                    "generationConfig": {"maxOutputTokens": 5},
+                }
+                d = _http_json(url, body, {"x-goog-api-key": cfg.gemini_api_key}, timeout=15)
+                cands = d.get("candidates") or []
+                if cands:
+                    res["gemini"] = {"status": "ok", "transport": "api", "model": cfg.gemini_model, "endpoint": cfg.gemini_endpoint}
+                else:
+                    res["gemini"] = {"status": "error", "transport": "api", "model": cfg.gemini_model, "error": f"no candidates: {d}"}
+            except Exception as e:
+                res["gemini"] = {"status": "error", "transport": "api", "model": cfg.gemini_model, "error": str(e)[:300]}
+
+    # 2. Local backend
+    try:
+        h = {"Content-Type": "application/json"}
+        if cfg.local_api_key:
+            h["Authorization"] = f"Bearer {cfg.local_api_key}"
+        req = urllib.request.Request(f"{cfg.local_base_url}/models", headers=h)
+        with urllib.request.urlopen(req, timeout=10) as r:
+            models_data = json.loads(r.read())
+            models_list = [m.get("id") for m in models_data.get("data", [])]
+            if not models_list:
+                res["local"] = {"status": "blocked", "model": cfg.local_model, "endpoint": cfg.local_base_url, "error": "models list empty; backend unavailable"}
+            elif live:
+                comp_req = urllib.request.Request(
+                    f"{cfg.local_base_url}/chat/completions",
+                    data=json.dumps({
+                        "model": cfg.local_model,
+                        "messages": [{"role": "user", "content": "Reply exactly SNOWBALL_LOCAL_READY"}],
+                        "max_tokens": 32,
+                        "temperature": 0,
+                        "chat_template_kwargs": {"enable_thinking": False},
+                        "extra_body": {"enable_thinking": False},
+                    }).encode(),
+                    headers=h,
+                    method="POST",
+                )
+                with urllib.request.urlopen(comp_req, timeout=15) as cr:
+                    c_resp = json.loads(cr.read())
+                    choices = c_resp.get("choices") or []
+                    content = (choices[0].get("message") or {}).get("content", "") if choices else ""
+                    if "SNOWBALL_LOCAL_READY" in content:
+                        res["local"] = {"status": "ok", "model": cfg.local_model, "endpoint": cfg.local_base_url, "models": models_list}
+                    else:
+                        res["local"] = {
+                            "status": "error",
+                            "model": cfg.local_model,
+                            "endpoint": cfg.local_base_url,
+                            "error": f"unusable completion (missing semantic marker; received: {content[:100]!r})",
+                        }
+            else:
+                res["local"] = {"status": "ok", "model": cfg.local_model, "endpoint": cfg.local_base_url, "models": models_list}
+    except Exception as e:
+        res["local"] = {"status": "error", "model": cfg.local_model, "endpoint": cfg.local_base_url, "error": str(e)[:300]}
+
+    # 3. Grok (omp)
+    resolved_omp = shutil.which(cfg.omp_bin) or (cfg.omp_bin if Path(cfg.omp_bin).exists() else None)
+    if not resolved_omp:
+        res["grok"] = {"status": "blocked", "model": cfg.grok_verifier_model, "error": f"omp binary not found at {cfg.omp_bin}"}
+    else:
+        if live:
+            try:
+                p = subprocess.run(
+                    [
+                        cfg.omp_bin,
+                        "-p",
+                        "--model",
+                        cfg.grok_verifier_model,
+                        "--thinking",
+                        cfg.grok_reasoning_effort,
+                        "--no-session",
+                        "--no-tools",
+                        "--system-prompt",
+                        "Reply with JSON: {\"verdicts\": []}",
+                        "test",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    stdin=subprocess.DEVNULL,
+                    timeout=30,
+                )
+                if p.returncode == 0:
+                    try:
+                        v_data = json.loads(p.stdout)
+                        if isinstance(v_data, dict) and "verdicts" in v_data:
+                            res["grok"] = {"status": "ok", "model": cfg.grok_verifier_model, "binary": resolved_omp}
+                        else:
+                            res["grok"] = {"status": "error", "model": cfg.grok_verifier_model, "error": f"malformed JSON contract: {p.stdout[:100]!r}"}
+                    except Exception:
+                        res["grok"] = {"status": "error", "model": cfg.grok_verifier_model, "error": f"non-JSON output: {p.stdout[:100]!r}"}
+                else:
+                    res["grok"] = {"status": "error", "model": cfg.grok_verifier_model, "error": (p.stderr or p.stdout)[-300:]}
+            except Exception as e:
+                res["grok"] = {"status": "error", "model": cfg.grok_verifier_model, "error": str(e)[:300]}
+        else:
+            res["grok"] = {"status": "ok", "model": cfg.grok_verifier_model, "binary": resolved_omp}
+
+    # 4. Exa
+    try:
+        exa_budget = _sibling("exa_budget")
+        live_keys = exa_budget.rotator_live()
+        reserve = exa_budget.RESERVE
+        if live_keys <= reserve:
+            res["exa"] = {"status": "blocked", "live_keys": live_keys, "reserve": reserve, "error": f"live keys ({live_keys}) <= reserve floor ({reserve})"}
+        else:
+            rotator_url = getattr(cfg, "exa_rotator_url", EXA_ROTATOR)
+            req = urllib.request.Request(
+                f"{rotator_url}/search",
+                data=json.dumps({"query": "test", "numResults": 1}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as r:
+                res["exa"] = {"status": "ok", "live_keys": live_keys}
+    except Exception as e:
+        res["exa"] = {"status": "error", "error": str(e)[:300]}
+
+    res["all_ok"] = all(v.get("status") == "ok" for v in res.values())
+    return res
+
+
+def classify_page(
+    title: str,
+    text: str,
+    url: str,
+    links: list[str] | list[tuple[str, str]] | list[dict] | None = None,
+    engine: Any | None = None,
+) -> str:
+    """Classify page as 'hub', 'item', 'article', or 'junk'.
+    Clean hubs use code-defined row extraction; ambiguous pages use bounded classification.
+    """
+    del engine
+    lower_text = text.lower()
+    lower_title = title.lower()
+    url_path = urlsplit(url).path.lower()
+
+    # 1. Junk detection
+    if len(text.strip()) < 100:
+        return "junk"
+    if any(m in lower_text for m in ["domain for sale", "buy this domain", "page not found", "error 404", "parked domain"]):
+        return "junk"
+
+    link_count = len(links) if links is not None else len(re.findall(r"https?://", text))
+    apply_count = len(re.findall(r"\b(apply|deadline|grant|scholarship|fellowship|hackathon|bounty|program|cohort)\b", lower_text))
+    date_count = len(
+        re.findall(
+            r"\b202\d[-/]\d\d[-/]\d\d\b|\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]* \d{1,2},? 202\d\b",
+            lower_text,
+        )
+    )
+
+    # 2. Hub detection
+    hub_keywords = ["list of grants", "directory", "all opportunities", "active hackathons", "grant directory", "active grants"]
+    if any(h in lower_text or h in lower_title for h in hub_keywords):
+        return "hub"
+    if any(p in url_path for p in ["/grants-list", "/directory", "/opportunities", "/all-grants"]):
+        return "hub"
+    if link_count >= 10 and (apply_count >= 5 or date_count >= 3):
+        return "hub"
+
+    # 3. Item detection
+    has_amount = bool(
+        re.search(r"(\$|€|£|₹|rs\.?|usd|inr)\s*[\d,]+|\b[\d,]+\s*(usd|inr|eur|gbp|credits)\b", lower_text)
+    )
+    has_deadline = bool(re.search(r"\b(deadline|closes on|apply by|due date)\b", lower_text))
+    has_eligibility = bool(re.search(r"\b(eligibility|who can apply|requirements|open to)\b", lower_text))
+
+    if (has_amount or has_deadline) and (has_eligibility or "application" in lower_text or "fellowship" in lower_title or "award" in lower_title or "grant" in lower_title):
+        return "item"
+
+    return "article"
+
+
+def compute_family_relevance(title: str, text: str, family_focus: str) -> float:
+    """TF-IDF cosine relevance of page text against family focus."""
+    if not family_focus or not text:
+        return 0.5
+    page_terms = topic_terms(title or "", text[:5000])
+    focus_terms = topic_terms("", family_focus)
+    dot = sum(page_terms[t] * focus_terms[t] for t in page_terms.keys() & focus_terms.keys())
+    na = math.sqrt(sum(v * v for v in page_terms.values()))
+    nb = math.sqrt(sum(v * v for v in focus_terms.values()))
+    return dot / (na * nb) if na and nb else 0.0
+
+
+def validate_extraction(data: dict, source_text: str, fallback_url: str = "") -> dict:
+    """Validate extracted entities and claims against source text.
+    Ensures verbatim quotes, valid numbers/dates, and sets fallback_url when entity link is missing.
+    """
+    hay = norm_text(source_text).casefold()
+    rows, claims, names, links, dropped = [], [], [], [], 0
+
+    for r in data.get("rows") or []:
+        if not isinstance(r, dict):
+            dropped += 1
+            continue
+        name = str(r.get("name") or "").strip()
+        quote = str(r.get("evidence_quote") or "").strip()
+        if not (name and _present(name, hay) and 40 <= len(quote) <= 400 and _present(quote, hay)):
+            dropped += 1
+            continue
+
+        ok, why = mechanical_check(r, source_text)
+        if not ok:
+            dropped += 1
+            continue
+
+        raw_link = r.get("link")
+        link = None
+        if isinstance(raw_link, str) and raw_link.startswith(("http://", "https://")):
+            if raw_link in source_text or _present(raw_link, hay):
+                link = raw_link
+        if not link and fallback_url:
+            link = fallback_url
+
+        amount = r.get("amount")
+        try:
+            amount = float(amount) if amount not in (None, "") else None
+        except (TypeError, ValueError):
+            amount = None
+
+        dl = r.get("deadline")
+        dl = dl if isinstance(dl, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", dl) else None
+
+        rows.append({
+            "name": norm_text(name)[:200],
+            "org": (norm_text(str(r["org"]))[:200] if r.get("org") else None),
+            "kind": r.get("kind") if r.get("kind") in ENTITY_KINDS else "other",
+            "amount": amount,
+            "currency": (str(r["currency"]).upper()[:3] if r.get("currency") else None),
+            "deadline": dl,
+            "eligibility": (norm_text(str(r["eligibility"]))[:500] if r.get("eligibility") else None),
+            "location": (norm_text(str(r["location"]))[:200] if r.get("location") else None),
+            "link": link,
+            "evidence_quote": norm_text(quote),
+        })
+
+    for c in data.get("claims") or []:
+        if isinstance(c, dict) and c.get("text"):
+            cq = str(c.get("evidence_quote") or "").strip()
+            if 40 <= len(cq) <= 400 and _present(cq, hay):
+                if not (numbers_in(str(c["text"])) - numbers_in(source_text)):
+                    claims.append({
+                        "text": norm_text(str(c["text"]))[:500],
+                        "evidence_quote": norm_text(cq),
+                    })
+                else:
+                    dropped += 1
+            else:
+                dropped += 1
+        else:
+            dropped += 1
+
+    for n in data.get("names") or []:
+        if isinstance(n, str) and 2 < len(n) <= 120 and _present(n, hay):
+            names.append(norm_text(n))
+
+    for u in data.get("links") or []:
+        if isinstance(u, str) and u.startswith(("http://", "https://")) and u in source_text:
+            links.append(u)
+
+    return {"rows": rows, "claims": claims, "names": sorted(set(names)), "links": links, "dropped": dropped}
+
+
+# extract_page_entities and extract_validated are defined below after Engine and EXTRACT_SYSTEM.
 # ---------------------------------------------------------------------------------------------
 # Lock primitives, ported verbatim from docs/SYSTEM_DESIGN.md section 3. No LLM anywhere here.
 # ---------------------------------------------------------------------------------------------
@@ -767,6 +1141,24 @@ def numbers_in(s: str) -> set[str]:
     return {n.replace(",", "") for n in re.findall(r"\d[\d,]*\d|\d{2,}", s or "")}
 
 
+def material_numbers(s: str) -> set[str]:
+    """Amounts and other figures. Four-digit years are not material by themselves."""
+    return {n for n in numbers_in(s) if not re.fullmatch(r"20[0-3]\d", n)}
+
+
+def numbers_compatible(a: str, b: str) -> bool:
+    """Same amounts may merge. A year mentioned on only one side is not a different fact.
+    Two different amounts, or two different years that both appear, must stay apart.
+    """
+    if material_numbers(a) != material_numbers(b):
+        return False
+    years_a = {n for n in numbers_in(a) if re.fullmatch(r"20[0-3]\d", n)}
+    years_b = {n for n in numbers_in(b) if re.fullmatch(r"20[0-3]\d", n)}
+    if years_a and years_b and years_a != years_b:
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------------------------
 # Schema: section 5.1 verbatim, plus the orchestrator extension (private flag, per-engine spend).
 # ---------------------------------------------------------------------------------------------
@@ -782,7 +1174,7 @@ PRAGMA mmap_size = 268435456;
 
 DDL = """
 CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-INSERT INTO schema_meta VALUES ('schema_version', '1');
+INSERT INTO schema_meta VALUES ('schema_version', '2');
 CREATE TABLE families (
   name TEXT PRIMARY KEY, recheck_days INTEGER NOT NULL CHECK (recheck_days > 0),
   weight REAL NOT NULL DEFAULT 1.0, relevance_floor REAL NOT NULL DEFAULT 0.08, focus TEXT NOT NULL);
@@ -858,16 +1250,41 @@ CREATE TABLE hub_rows (
   entity_key TEXT REFERENCES entities(key), PRIMARY KEY (hub_page_id, row_hash));
 CREATE TABLE fetches (
   id INTEGER PRIMARY KEY, page_id INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE, at INTEGER NOT NULL,
-  route TEXT NOT NULL CHECK (route IN ('direct','exa_contents','zenrows','resi_proxy','arctic','hn','github','grok','feed')),
+  route TEXT NOT NULL CHECK (route IN ('direct','exa_contents','zenrows','resi_proxy','arctic','hn','github','grok','feed','browser')),
   http_status INTEGER, bytes INTEGER, ms INTEGER,
-  outcome TEXT NOT NULL CHECK (outcome IN ('ok','walled','outage','failure','ssrf_blocked','oversize')),
+  outcome TEXT NOT NULL CHECK (outcome IN ('ok','walled','outage','failure','ssrf_blocked','oversize','deadline')),
   pinned_ip TEXT, due INTEGER NOT NULL);
 CREATE INDEX fetches_page_at ON fetches(page_id, at);
 CREATE TABLE paid_fetches (
   id INTEGER PRIMARY KEY, page_id INTEGER NOT NULL REFERENCES pages(id),
-  provider TEXT NOT NULL CHECK (provider IN ('zenrows','resi_proxy')), cost_units INTEGER NOT NULL,
-  at INTEGER NOT NULL, outcome TEXT);
+  provider TEXT NOT NULL CHECK (provider IN ('zenrows','resi_proxy','2captcha')), cost_units INTEGER NOT NULL,
+  at INTEGER NOT NULL, outcome TEXT,
+  reservation_id INTEGER, reserved_micro_usd INTEGER DEFAULT 0, actual_micro_usd INTEGER,
+  task_ref TEXT, reservation_state TEXT);
 CREATE INDEX paid_fetches_day ON paid_fetches(at);
+CREATE TABLE access_attempts (
+  id INTEGER PRIMARY KEY,
+  fetch_id INTEGER REFERENCES fetches(id) ON DELETE CASCADE,
+  page_id INTEGER REFERENCES pages(id) ON DELETE CASCADE,
+  mode TEXT NOT NULL, route TEXT, status TEXT, http_status INTEGER,
+  bytes INTEGER DEFAULT 0, ms INTEGER DEFAULT 0, error TEXT, at INTEGER NOT NULL);
+CREATE INDEX access_attempts_fetch ON access_attempts(fetch_id);
+CREATE INDEX access_attempts_page ON access_attempts(page_id);
+CREATE TABLE paid_budget_reservations (
+  id INTEGER PRIMARY KEY,
+  acquisition_id TEXT NOT NULL CHECK (length(acquisition_id) > 0),
+  provider TEXT NOT NULL CHECK (length(provider) > 0),
+  reserved_micro_usd INTEGER NOT NULL CHECK (reserved_micro_usd >= 0),
+  actual_micro_usd INTEGER CHECK (actual_micro_usd IS NULL OR actual_micro_usd >= 0),
+  settled INTEGER NOT NULL DEFAULT 0 CHECK (settled IN (0, 1)),
+  outcome TEXT, task_ref TEXT,
+  is_solver INTEGER NOT NULL DEFAULT 0 CHECK (is_solver IN (0, 1)),
+  created_at_utc TEXT NOT NULL,
+  window_day_ist TEXT NOT NULL CHECK (
+    window_day_ist GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+  window_month_ist TEXT NOT NULL CHECK (window_month_ist GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]'));
+CREATE INDEX paid_budget_reservations_day ON paid_budget_reservations(window_day_ist, provider, settled);
+CREATE INDEX paid_budget_reservations_month ON paid_budget_reservations(window_month_ist, provider, is_solver);
 CREATE TABLE names (
   id INTEGER PRIMARY KEY, norm_name TEXT NOT NULL UNIQUE, raw TEXT NOT NULL,
   first_page_id INTEGER NOT NULL REFERENCES pages(id), topic_id INTEGER REFERENCES topics(id),
@@ -987,6 +1404,15 @@ class Store:
         mem.execute("PRAGMA foreign_keys = ON")
         return Store(mem)
 
+    @classmethod
+    def in_memory(cls) -> Store:
+        """A fresh in-memory database with full schema initialized."""
+        mem = sqlite3.connect(":memory:", isolation_level=None, timeout=5.0, check_same_thread=False)
+        mem.executescript(PRAGMAS)
+        s = cls(mem)
+        s.init_schema()
+        return s
+
     def init_schema(self) -> None:
         have = self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_meta'").fetchone()
         if not have:
@@ -1001,7 +1427,129 @@ class Store:
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (ORCH_SCHEMA_VERSION,),
         )
+        ver_row = self.db.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()
+        current_version = int(ver_row["value"]) if ver_row and str(ver_row["value"]).isdigit() else 1
+        if current_version < 2:
+            log("migrating snowball schema to version 2")
 
+        with self.tx() as db:
+            # 1. access_attempts table
+            db.execute("""
+            CREATE TABLE IF NOT EXISTS access_attempts (
+                id INTEGER PRIMARY KEY,
+                fetch_id INTEGER REFERENCES fetches(id) ON DELETE CASCADE,
+                page_id INTEGER REFERENCES pages(id) ON DELETE CASCADE,
+                mode TEXT NOT NULL,
+                route TEXT,
+                status TEXT,
+                http_status INTEGER,
+                bytes INTEGER DEFAULT 0,
+                ms INTEGER DEFAULT 0,
+                error TEXT,
+                at INTEGER NOT NULL
+            );
+            """)
+            db.execute("CREATE INDEX IF NOT EXISTS access_attempts_fetch ON access_attempts(fetch_id);")
+            db.execute("CREATE INDEX IF NOT EXISTS access_attempts_page ON access_attempts(page_id);")
+
+            # 2. paid reservation columns on paid_fetches
+            pf_cols = {r["name"] for r in db.execute("PRAGMA table_info(paid_fetches)").fetchall()}
+            if "reservation_id" not in pf_cols:
+                db.execute("ALTER TABLE paid_fetches ADD COLUMN reservation_id INTEGER")
+            if "reserved_micro_usd" not in pf_cols:
+                db.execute("ALTER TABLE paid_fetches ADD COLUMN reserved_micro_usd INTEGER DEFAULT 0")
+            if "actual_micro_usd" not in pf_cols:
+                db.execute("ALTER TABLE paid_fetches ADD COLUMN actual_micro_usd INTEGER")
+            if "task_ref" not in pf_cols:
+                db.execute("ALTER TABLE paid_fetches ADD COLUMN task_ref TEXT")
+            if "reservation_state" not in pf_cols:
+                db.execute("ALTER TABLE paid_fetches ADD COLUMN reservation_state TEXT")
+
+            # 3. Ensure paid_budget_reservations table exists
+            db.execute("""
+            CREATE TABLE IF NOT EXISTS paid_budget_reservations (
+                id INTEGER PRIMARY KEY,
+                acquisition_id TEXT NOT NULL CHECK (length(acquisition_id) > 0),
+                provider TEXT NOT NULL CHECK (length(provider) > 0),
+                reserved_micro_usd INTEGER NOT NULL CHECK (reserved_micro_usd >= 0),
+                actual_micro_usd INTEGER CHECK (actual_micro_usd IS NULL OR actual_micro_usd >= 0),
+                settled INTEGER NOT NULL DEFAULT 0 CHECK (settled IN (0, 1)),
+                outcome TEXT,
+                task_ref TEXT,
+                is_solver INTEGER NOT NULL DEFAULT 0 CHECK (is_solver IN (0, 1)),
+                created_at_utc TEXT NOT NULL,
+                window_day_ist TEXT NOT NULL CHECK (
+                    window_day_ist GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'
+                ),
+                window_month_ist TEXT NOT NULL CHECK (window_month_ist GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]')
+            );
+            """)
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS paid_budget_reservations_day "
+                "ON paid_budget_reservations(window_day_ist, provider, settled);"
+            )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS paid_budget_reservations_month "
+                "ON paid_budget_reservations(window_month_ist, provider, is_solver);"
+            )
+
+            # Update schema_version to 2
+            db.execute(
+                "INSERT INTO schema_meta(key, value) VALUES('schema_version', '2') "
+                "ON CONFLICT(key) DO UPDATE SET value='2'"
+            )
+
+        if current_version < 3:
+            log("migrating snowball schema to version 3")
+            self.db.execute("PRAGMA foreign_keys = OFF;")
+            with self.tx() as db:
+                f_row = db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='fetches'").fetchone()
+                if f_row and ("'browser'" not in (f_row["sql"] or "") or "'deadline'" not in (f_row["sql"] or "")):
+                    db.execute("""
+                    CREATE TABLE fetches_v3 (
+                      id              INTEGER PRIMARY KEY,
+                      page_id         INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+                      at              INTEGER NOT NULL,
+                      route           TEXT NOT NULL CHECK (route IN ('direct','exa_contents','zenrows','resi_proxy','arctic','hn','github','grok','feed','browser')),
+                      http_status     INTEGER,
+                      bytes           INTEGER,
+                      ms              INTEGER,
+                      outcome         TEXT NOT NULL CHECK (outcome IN ('ok','walled','outage','failure','ssrf_blocked','oversize','deadline')),
+                      pinned_ip       TEXT,
+                      due             INTEGER NOT NULL
+                    );
+                    """)
+                    db.execute("INSERT INTO fetches_v3 SELECT id, page_id, at, route, http_status, bytes, ms, outcome, pinned_ip, due FROM fetches;")
+                    db.execute("DROP TABLE fetches;")
+                    db.execute("ALTER TABLE fetches_v3 RENAME TO fetches;")
+                    db.execute("CREATE INDEX IF NOT EXISTS fetches_page_at ON fetches(page_id, at);")
+
+                pf_row = db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='paid_fetches'").fetchone()
+                if pf_row and "'2captcha'" not in (pf_row["sql"] or ""):
+                    db.execute("""
+                    CREATE TABLE paid_fetches_v3 (
+                      id              INTEGER PRIMARY KEY,
+                      page_id         INTEGER NOT NULL REFERENCES pages(id),
+                      provider        TEXT NOT NULL CHECK (provider IN ('zenrows','resi_proxy','2captcha')),
+                      cost_units      INTEGER NOT NULL,
+                      at              INTEGER NOT NULL,
+                      outcome         TEXT,
+                      reservation_id  INTEGER,
+                      reserved_micro_usd INTEGER DEFAULT 0,
+                      actual_micro_usd   INTEGER,
+                      task_ref        TEXT,
+                      reservation_state TEXT
+                    );
+                    """)
+                    existing_cols = [r["name"] for r in db.execute("PRAGMA table_info(paid_fetches)").fetchall()]
+                    common = [c for c in ["id", "page_id", "provider", "cost_units", "at", "outcome", "reservation_id", "reserved_micro_usd", "actual_micro_usd", "task_ref", "reservation_state"] if c in existing_cols]
+                    db.execute(f"INSERT INTO paid_fetches_v3 ({','.join(common)}) SELECT {','.join(common)} FROM paid_fetches;")
+                    db.execute("DROP TABLE paid_fetches;")
+                    db.execute("ALTER TABLE paid_fetches_v3 RENAME TO paid_fetches;")
+                    db.execute("CREATE INDEX IF NOT EXISTS paid_fetches_day ON paid_fetches(at);")
+
+                db.execute("INSERT INTO schema_meta(key, value) VALUES('schema_version', '3') ON CONFLICT(key) DO UPDATE SET value='3'")
+            self.db.execute("PRAGMA foreign_keys = ON;")
     @contextlib.contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:
         for n in range(6):
@@ -1086,6 +1634,10 @@ class TokenBudgetMiddleware:
             )
         return (r["tokens_in"], r["tokens_out"]) if r else (0, 0)
 
+    def tokens_today(self, engine: str) -> int:
+        ti, to = self.spent(engine)
+        return ti + to
+
     def remaining(self, engine: str) -> int:
         ti, to = self.spent(engine)
         gi, go = self.spent()
@@ -1106,9 +1658,10 @@ class TokenBudgetMiddleware:
         if tb.used_in >= tb.max_in:
             tb.partial = True
             raise BudgetExhausted(f"{tb.engine} task input budget spent ({tb.used_in}/{tb.max_in})")
-        if self.remaining(tb.engine) < prompt_tokens + out_tokens:
-            raise BudgetExhausted(f"{tb.engine} daily cap: {self.remaining(tb.engine)} tokens left")
-        self._add(tb.engine, prompt_tokens, out_tokens, calls=1)
+        if prompt_tokens < 0 or out_tokens < 0:
+            raise BudgetExhausted("negative reservation")
+        # Cap check and the spend insert share one immediate transaction.
+        self._add(tb.engine, prompt_tokens, out_tokens, calls=1, enforce_cap=True)
         tb.used_in += prompt_tokens
         tb.used_out += out_tokens
 
@@ -1117,23 +1670,47 @@ class TokenBudgetMiddleware:
         do = (real_out - est_out) if real_out is not None else 0
         if di or do:
             self._add(tb.engine, di, do, calls=0)
-            tb.used_in += di
-            tb.used_out += do
+            tb.used_in = max(0, tb.used_in + di)
+            tb.used_out = max(0, tb.used_out + do)
 
-    def _add(self, engine: str, tin: int, tout: int, calls: int) -> None:
+    def _spent_in(self, db: sqlite3.Connection, engine: str | None, day: str) -> tuple[int, int]:
+        if engine:
+            row = db.execute(
+                "SELECT tokens_in, tokens_out FROM engine_spend WHERE day=? AND engine=?",
+                (day, engine),
+            ).fetchone()
+        else:
+            row = db.execute(
+                "SELECT llm_tokens_in AS tokens_in, llm_tokens_out AS tokens_out FROM budgets WHERE day=?",
+                (day,),
+            ).fetchone()
+        if not row:
+            return (0, 0)
+        return (int(row["tokens_in"] or 0), int(row["tokens_out"] or 0))
+
+    def _add(self, engine: str, tin: int, tout: int, calls: int, enforce_cap: bool = False) -> None:
         day = today_ist()
         with self._lock, self.store.tx() as db:
+            if enforce_cap:
+                eti, eto = self._spent_in(db, engine, day)
+                gti, gto = self._spent_in(db, None, day)
+                left = max(0, min(self.cfg.caps[engine] - eti - eto, self.cfg.llm_tokens_per_day - gti - gto))
+                if left < tin + tout:
+                    raise BudgetExhausted(f"{engine} daily cap: {left} tokens left")
             db.execute(
                 "INSERT INTO engine_spend(day, engine, calls, tokens_in, tokens_out) VALUES (?,?,?,?,?) "
-                "ON CONFLICT(day, engine) DO UPDATE SET calls=calls+excluded.calls, "
-                "tokens_in=tokens_in+excluded.tokens_in, tokens_out=tokens_out+excluded.tokens_out",
-                (day, engine, calls, tin, tout),
+                "ON CONFLICT(day, engine) DO UPDATE SET "
+                "calls=MAX(0, engine_spend.calls + ?), "
+                "tokens_in=MAX(0, engine_spend.tokens_in + ?), "
+                "tokens_out=MAX(0, engine_spend.tokens_out + ?)",
+                (day, engine, max(0, calls), max(0, tin), max(0, tout), calls, tin, tout),
             )
             db.execute(
                 "INSERT INTO budgets(day, llm_tokens_in, llm_tokens_out) VALUES (?,?,?) "
-                "ON CONFLICT(day) DO UPDATE SET llm_tokens_in=llm_tokens_in+excluded.llm_tokens_in, "
-                "llm_tokens_out=llm_tokens_out+excluded.llm_tokens_out",
-                (day, tin, tout),
+                "ON CONFLICT(day) DO UPDATE SET "
+                "llm_tokens_in=MAX(0, budgets.llm_tokens_in + ?), "
+                "llm_tokens_out=MAX(0, budgets.llm_tokens_out + ?)",
+                (day, max(0, tin), max(0, tout), tin, tout),
             )
 
     def on_outage(self, engine: str, retry_after: int | None, err: str) -> int:
@@ -1297,11 +1874,95 @@ class GeminiBulkExtractor(Engine):
         self.model = cfg.gemini_pro_model if pro else cfg.gemini_model
 
     def available(self) -> tuple[bool, str]:
-        if not self.cfg.gemini_api_key and not self.dry:
-            return False, "GEMINI_API_KEY not set"
-        return super().available()
+        transport = getattr(self.cfg, "gemini_transport", "api")
+        if transport == "ssh-omp":
+            ssh_bin = shutil.which("ssh")
+            if not self.dry and not ssh_bin:
+                return False, "ssh binary not found"
+            return super().available()
+        elif transport == "omp":
+            resolved_omp = shutil.which(self.cfg.omp_bin) or (self.cfg.omp_bin if Path(self.cfg.omp_bin).exists() else None)
+            if not self.dry and not resolved_omp:
+                return False, f"omp not found at {self.cfg.omp_bin}"
+            return super().available()
+        else:  # "api"
+            if not self.cfg.gemini_api_key and not self.dry:
+                return False, "GEMINI_API_KEY not set"
+            return super().available()
 
     def _call(self, system: str, user: str, max_out: int) -> EngineReply:
+        transport = getattr(self.cfg, "gemini_transport", "api")
+        if transport == "ssh-omp":
+            cmd = [
+                "ssh",
+                "-n",
+                self.cfg.ssh_model_host,
+                "systemd-run",
+                "--user",
+                "--scope",
+                "-p",
+                "MemoryMax=3G",
+                self.cfg.ssh_omp_bin,
+                "-p",
+                "--model",
+                self.model,
+                "--no-tools",
+                "--no-session",
+                "--no-extensions",
+                "--no-title",
+                "--system-prompt",
+                system,
+            ]
+            try:
+                r = subprocess.run(
+                    cmd,
+                    input=user,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.cfg.ssh_timeout_sec,
+                )
+            except subprocess.TimeoutExpired as e:
+                raise EngineOutage(f"ssh omp timed out after {self.cfg.ssh_timeout_sec}s") from e
+            if r.returncode != 0:
+                err = (r.stderr or "")[-300:]
+                if re.search(r"\b(429|rate.?limit|overloaded|5\d\d|timed? ?out)\b", err, re.IGNORECASE):
+                    raise EngineOutage(f"ssh omp exit {r.returncode}: {err}")
+                raise EngineFailure(f"ssh omp exit {r.returncode}: {err}")
+            text = r.stdout
+            if not text.strip():
+                raise EngineFailure("ssh omp returned empty output")
+            return EngineReply(text, est_tokens(user), est_tokens(text), self.model)
+
+        if transport == "omp":
+            cmd = [
+                self.cfg.omp_bin,
+                "-p",
+                "--model",
+                self.model,
+                "--no-session",
+                "--no-tools",
+                "--no-extensions",
+                "--no-title",
+                "--system-prompt",
+                system,
+            ]
+            try:
+                r = subprocess.run(
+                    cmd,
+                    input=user,
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                    env={k: v for k, v in os.environ.items() if k != "OPENROUTER_API_KEY"},
+                )
+            except subprocess.TimeoutExpired as e:
+                raise EngineOutage("omp gemini timed out") from e
+            if r.returncode != 0:
+                raise EngineFailure(f"omp gemini exit {r.returncode}: {(r.stderr or '')[-300:]}")
+            text = r.stdout
+            return EngineReply(text, est_tokens(user), est_tokens(text), self.model)
+
+        # Default "api": Google AI Studio REST API
         url = f"{self.cfg.gemini_endpoint}/{self.model}:generateContent"
         body = {
             "systemInstruction": {"parts": [{"text": system}]},
@@ -1364,6 +2025,7 @@ class GrokAdversarialVerifier(Engine):
                     cwd=td,
                     capture_output=True,
                     text=True,
+                    stdin=subprocess.DEVNULL,
                     timeout=self.cfg.grok_verify_timeout_sec,
                     env={k: v for k, v in os.environ.items() if k != "OPENROUTER_API_KEY"},
                 )
@@ -1396,26 +2058,21 @@ class GrokAdversarialVerifier(Engine):
             cmd += ["-m", self.cfg.grok_x_model]
         td = tempfile.mkdtemp(prefix="snowball-grokx-")
         logf = Path(td) / "out.log"
-        with open(logf, "w") as fh:
-            proc = subprocess.Popen(
-                cmd, cwd=td, stdout=fh, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True
-            )
+        proc = process_control.launch_owned_process(cmd, cwd=td, stdout_path=logf)
         items: list[dict] | None = None
         deadline = time.time() + self.cfg.grok_x_poll_sec
         try:
             while time.time() < deadline:
                 time.sleep(3)
-                items = _last_json_array(logf.read_text(errors="replace"))
+                try:
+                    items = _last_json_array(logf.read_text(errors="replace"))
+                except Exception:  # noqa: BLE001 - parse failure must still stop the owned tree
+                    items = None
+                    raise
                 if items is not None or proc.poll() is not None:
                     break
         finally:
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.killpg(proc.pid, signal.SIGTERM)
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                proc.wait(timeout=5)
-            if proc.poll() is None:
-                with contextlib.suppress(ProcessLookupError, PermissionError):
-                    os.killpg(proc.pid, signal.SIGKILL)
+            process_control.stop_owned_process_tree(proc)
         self.budget._add(self.name, est_tokens(prompt), est_tokens(logf.read_text(errors="replace")), calls=1)
         with contextlib.suppress(OSError):
             logf.unlink()
@@ -1434,33 +2091,33 @@ def _last_json_array(s: str) -> list[dict] | None:
     return None
 
 
+def status_id_in_window(url: str, window_days: int, *, now_utc: datetime | None = None) -> bool:
+    """Negative filter only. A decodable in-window id is not a retrieved post."""
+    match = re.search(r"(?:x|twitter)\.com/[A-Za-z0-9_]{1,15}/status/(\d+)", url)
+    if not match or window_days < 0:
+        return False
+    ts = snowflake_utc(match.group(1))
+    if ts is None:
+        return False
+    current = now_utc or datetime.now(timezone.utc)
+    lo = current - timedelta(days=window_days + 1)
+    hi = current + timedelta(minutes=5)
+    return lo <= ts <= hi
+
+
 def validate_x_posts(items: list[dict], window_days: int) -> list[dict]:
-    """Section 7.6. A post survives only if its status id decodes inside the window and agrees with created_at."""
-    lo = datetime.now(timezone.utc) - timedelta(days=window_days + 1)
-    hi = datetime.now(timezone.utc) + timedelta(minutes=5)
-    out = []
-    for it in items:
-        m = re.search(r"(?:x|twitter)\.com/([A-Za-z0-9_]{1,15})/status/(\d+)", str(it.get("url", "")))
-        ts = snowflake_utc(m.group(2)) if m else None
-        if not ts or not (lo <= ts <= hi) or not str(it.get("text", "")).strip():
-            continue
-        claimed = it.get("created_at")
-        if claimed:
-            with contextlib.suppress(ValueError):
-                c = datetime.fromisoformat(str(claimed).replace("Z", "+00:00"))
-                if c.tzinfo is None:
-                    c = c.replace(tzinfo=timezone.utc)
-                if abs((c - ts).total_seconds()) > 48 * 3600:
-                    continue  # the model's date disagrees with the id: a hallucination, final
-        out.append(
-            {
-                "url": f"https://x.com/{m.group(1)}/status/{m.group(2)}",
-                "author": m.group(1),
-                "created_at": ts.isoformat(),
-                "text": norm_text(str(it["text"]))[:4000],
-            }
-        )
-    return out
+    """Return no quotable posts.
+
+    Ids outside the window fail status_id_in_window. Ids inside the window are
+    still not posts: the grok CLI returns model text, and X Search does not
+    document a field that carries the fetched post body. A citation URL is not
+    stored as that body.
+    """
+    if not isinstance(items, list) or isinstance(window_days, bool) or not isinstance(window_days, int):
+        raise TypeError("x posts")
+    if window_days < 0:
+        raise ValueError("window_days")
+    return []
 
 
 class LocalOrnithFallback(Engine):
@@ -1473,7 +2130,11 @@ class LocalOrnithFallback(Engine):
             return super().available()
         try:
             req = urllib.request.Request(f"{self.cfg.local_base_url}/models", headers=self._headers())
-            urllib.request.urlopen(req, timeout=10).close()
+            with urllib.request.urlopen(req, timeout=10) as r:
+                d = json.loads(r.read())
+                models = [m.get("id") for m in d.get("data", [])]
+                if not models:
+                    return False, f"{self.cfg.local_base_url} returned empty models list"
         except Exception as e:  # noqa: BLE001 - any failure means the tunnel is down
             return False, f"{self.cfg.local_base_url} unreachable: {type(e).__name__}"
         return super().available()
@@ -1506,6 +2167,8 @@ class LocalOrnithFallback(Engine):
             "max_tokens": max(max_out, 16384),
             "stream_options": {"include_usage": True},
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            "chat_template_kwargs": {"enable_thinking": False},
+            "extra_body": {"enable_thinking": False},
         }
         req = urllib.request.Request(
             f"{self.cfg.local_base_url}/chat/completions",
@@ -1575,31 +2238,88 @@ ARCTIC_SUBS = {
 }
 
 
-@dataclass
-class FetchResult:
-    canon: str
-    route: str
-    outcome: str  # ok | walled | outage | failure | ssrf_blocked | oversize
-    status: int | None = None
-    title: str = ""
-    text: str = ""
-    links: list[tuple[str, str]] = field(default_factory=list)
-    wall_kind: str | None = None
-    retry_after: int | None = None
-    pinned_ip: str | None = None
-    ms: int = 0
-    nbytes: int = 0
-    final_url: str | None = None
-    truncated: bool = False
+def extract_page_entities(
+    source_text: str,
+    url: str,
+    title: str = "",
+    engine: Engine | None = None,
+    cfg: Config | None = None,
+    store: Store | None = None,
+    topic: dict | None = None,
+    family: dict | None = None,
+) -> dict[str, Any]:
+    """Production extraction entrypoint used by both fetch pipeline and evaluator.
+    Calls configured model engine with EXTRACT_SYSTEM and prompt, parses JSON, and guards with validate_extraction.
+    Raises EngineOutage or EngineFailure if the model is unavailable or fails; never returns fake heuristics labelled production.
+    """
+    if not source_text.strip():
+        return {"rows": [], "claims": [], "names": [], "links": [], "dropped": 0}
+
+    cfg = cfg or load_config()
+    if engine is None:
+        store = store or Store.in_memory()
+        budget = TokenBudgetMiddleware(store, cfg)
+        if cfg.mode == "gemini-bulk":
+            engine = GeminiBulkExtractor(cfg, budget, dry=False)
+        elif cfg.mode == "local":
+            engine = LocalOrnithFallback(cfg, budget, dry=False)
+        else:
+            gem = GeminiBulkExtractor(cfg, budget, dry=False)
+            ok, _ = gem.available()
+            if ok:
+                engine = gem
+            else:
+                engine = LocalOrnithFallback(cfg, budget, dry=False)
+
+    ok, why = engine.available()
+    if not ok:
+        raise EngineFailure(f"Engine {engine.name} unavailable for extraction: {why}")
+
+    t_title = (topic or {}).get("title") or title or "Research"
+    t_focus = (topic or {}).get("focus") or "entities, grants, and opportunities"
+    f_name = (family or {}).get("name") or "opportunities"
+
+    nonce = secrets.token_hex(8)
+    parts = [
+        f"Topic: {t_title}\nFocus: {t_focus}\nFamily: {f_name}",
+        EXTRACT_SCHEMA_HINT,
+    ]
+    if hasattr(sanitizer, "fence_untrusted_source"):
+        parts.append(sanitizer.fence_untrusted_source(source_text, nonce, url=url, title=title))
+    else:
+        parts.append(
+            f'Source URL: {url}\nTitle: {title}\n<untrusted_source id="{nonce}">\n{source_text}\n</untrusted_source>'
+        )
+    user = "\n\n".join(parts)
+
+    max_in, max_out = cfg.extract_budget.get(engine.name, (12000, 4000))
+    tb = TaskBudget(engine.name, max_in, max_out)
+
+    reply = engine.complete(EXTRACT_SYSTEM, user, tb, max_out)
+    try:
+        data = parse_json_object(reply.text)
+    except EngineFailure:
+        reply = engine.complete(
+            EXTRACT_SYSTEM,
+            user + "\n\nYour last reply was not valid JSON. Return only the JSON object.",
+            tb,
+            max_out,
+        )
+        data = parse_json_object(reply.text)
+
+    return validate_extraction(data, source_text, fallback_url=url)
 
 
-@dataclass
-class SearchHit:
-    url: str
-    title: str = ""
-    text: str = ""
-    route: str = "direct"
-
+def extract_validated(
+    text: str,
+    url: str = "",
+    title: str = "",
+    engine: Any | None = None,
+    topic: dict | None = None,
+    family: dict | None = None,
+    cfg: Config | None = None,
+) -> dict:
+    return extract_page_entities(text, url, title=title, engine=engine, topic=topic, family=family, cfg=cfg)
 
 class DomainBuckets:
     """Per-domain token bucket, burst 3 (section 4.3). In memory; paused_until lives in the DB."""
@@ -1628,6 +2348,43 @@ def _get_json(url: str, headers: dict | None = None, timeout: int = 60) -> Any:
         return json.loads(r.read())
 
 
+def _page_id(page: Any) -> int:
+    if page is None:
+        return 0
+    try:
+        return int(page["id"])
+    except (KeyError, TypeError, ValueError):
+        return 0
+
+
+def _captcha_tariff(caps: dict) -> int:
+    tariffs = caps.get("tariffs")
+    if not isinstance(tariffs, dict):
+        return 0
+    value = tariffs.get("captcha")
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return 0
+    return value
+
+
+def _policy_wall(result: FetchResult) -> str | None:
+    """Map a fetch result onto the access-policy wall names. Database wall kinds stay separate."""
+    if result.wall_kind == "robots":
+        return "robots"
+    if result.wall_kind == "login":
+        return "login"
+    if result.status == 429:
+        return "429"
+    kind = paid_fetch.challenge_kind(result.text or "")
+    if result.status in {401, 403, 407, 451}:
+        if kind in {"challenge_turnstile", "challenge_recaptcha"}:
+            return kind
+        return {401: "generic_401", 403: "generic_403", 407: "generic_407", 451: "generic_451"}[result.status]
+    if kind:
+        return kind
+    return None
+
+
 class FetchRouter:
     def __init__(self, cfg: Config, store: Store, grok: GrokAdversarialVerifier, dry: bool) -> None:
         self.cfg, self.store, self.grok, self.dry = cfg, store, grok, dry
@@ -1641,6 +2398,20 @@ class FetchRouter:
             exa_budget = _sibling("exa_budget")
             return exa_budget.rotator_live() > exa_budget.RESERVE
         except Exception:  # noqa: BLE001 - no rotator means no Exa, not a crash
+            return False
+
+    def check_paid_access(self, url: str, private: bool = False, wall_kind: str | int | None = None) -> bool:
+        """Call access_policy.decide before any paid route. Unknown domains and terminal walls
+        never call a paid function. Do not add a live paid call."""
+        try:
+            ap_mod = _sibling("access_policy")
+            policy_path = ROOT / "access.yml"
+            if not policy_path.exists():
+                policy_path = ROOT / "access.example.yml"
+            policy = ap_mod.load_access_policy(policy_path)
+            decision = policy.decide(url, private=private, wall_kind=wall_kind)
+            return "paid" in decision.allowed_modes
+        except Exception:  # noqa: BLE001 - policy failure denies paid; it never authorizes it
             return False
 
     def search(self, raw: str, source: str, window_days: int, family: str = "opportunities") -> list[SearchHit]:
@@ -1709,11 +2480,40 @@ class FetchRouter:
             ]
         if source == "grok":
             posts = self.grok.x_search(raw, window_days)
-            return [SearchHit(p["url"], f"@{p['author']} {p['created_at'][:10]}", p["text"], "grok") for p in posts]
+            # quotable is never set: model text must not become a page body.
+            return [
+                SearchHit(p["url"], f"@{p.get('author', '')}", p["text"], "grok")
+                for p in posts
+                if p.get("quotable") is True and str(p.get("text") or "").strip()
+            ]
         raise ValueError(f"unknown source {source}")
+    def find_similar(self, url: str) -> list[SearchHit]:
+        if self.dry:
+            self.planned.append(f"findSimilar: {url}")
+            return []
+        if not self.exa_allowed():
+            return []
+        try:
+            body = json.dumps({"url": url, "numResults": 5}).encode()
+            req = urllib.request.Request(
+                f"{EXA_ROTATOR}/findSimilar", data=body, method="POST", headers={"Content-Type": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=30) as r:
+                res = json.loads(r.read()).get("results", [])
+            return [SearchHit(x.get("url", ""), x.get("title") or "", x.get("text") or "", "exa_contents") for x in res]
+        except Exception as e:
+            log(f"findSimilar error: {e}")
+            return []
+
 
     # ---- fetch (wave 1b) ----
-    def fetch(self, raw_url: str, prefilled: SearchHit | None = None) -> FetchResult:
+    def fetch(
+        self,
+        raw_url: str,
+        prefilled: SearchHit | None = None,
+        private: bool = False,
+        page: Any = None,
+    ) -> FetchResult:
         canon = canonical_url(raw_url) or raw_url
         host = urlsplit(canon).hostname or ""
         if self.dry:
@@ -1734,8 +2534,8 @@ class FetchRouter:
                 r = FetchResult(canon, "grok", "walled", wall_kind="login")
             else:
                 r = self._fetch_direct(raw_url, canon)
-                if r.outcome in ("walled", "outage") and prefilled and prefilled.text and r.wall_kind != "robots":
-                    r = FetchResult(canon, "exa_contents", "ok", 200, prefilled.title, prefilled.text)
+                # Search snippets are not page bodies. Exa contents is a separate lookup.
+                r = self._escalate(r, canon, private, page)
         except SSRFBlocked as e:
             r = FetchResult(canon, "direct", "ssrf_blocked", wall_kind=None)
             log(f"ssrf blocked {canon}: {e}")
@@ -1750,6 +2550,275 @@ class FetchRouter:
             log(f"fetch transport error {canon}: {type(e).__name__}")
         r.ms = int((time.time() - t0) * 1000)
         return r
+
+    def _escalate(self, result: FetchResult, canon: str, private: bool, page: Any) -> FetchResult:
+        """Exa contents, then one configured paid route. Terminal walls and 429 stay where they are."""
+        if private or result.outcome in {"ok", "outage", "ssrf_blocked"}:
+            return result
+        if result.status == 429 or result.wall_kind in {"robots", "login"}:
+            return result
+        policy_wall = _policy_wall(result)
+        if policy_wall in {
+            "generic_401",
+            "generic_403",
+            "generic_407",
+            "generic_451",
+            "paywall",
+            "ban",
+            "429",
+            "unsupported_challenge",
+        }:
+            return result
+        challenge = policy_wall in {"challenge_turnstile", "challenge_recaptcha"}
+        js_shell = result.outcome == "failure" and result.status in {None, 200} and policy_wall is None
+        if not challenge and not js_shell:
+            return result
+        source_html = result.text or ""
+        exa = self._try_exa(canon)
+        if exa is not None and exa.outcome == "ok":
+            return exa
+        attempt = self._try_paid(canon, private, page, policy_wall)
+        if attempt is None or not attempt.called:
+            if attempt is not None and attempt.reason == "budget":
+                result.outcome = "walled"
+                result.wall_kind = "budget"
+            return self._finish_escalation(result, canon, private, page, source_html)
+        wall = attempt.wall_kind if attempt.wall_kind in {"http", "challenge", "login", "robots", "budget"} else None
+        paid_result = FetchResult(
+            canon,
+            attempt.route,
+            attempt.outcome,
+            attempt.status,
+            attempt.title,
+            attempt.text,
+            wall_kind=wall,
+            nbytes=attempt.nbytes,
+            final_url=attempt.final_url,
+        )
+        return self._finish_escalation(paid_result, canon, private, page, source_html)
+
+    def _finish_escalation(
+        self,
+        result: FetchResult,
+        canon: str,
+        private: bool,
+        page: Any,
+        source_html: str = "",
+    ) -> FetchResult:
+        """Solve only when the fixture is on and a browser exists. Otherwise keep the fetch result."""
+        if not self.cfg.challenge_fixture or private or result.outcome == "ok":
+            return result
+        kind = self._challenge_name(result, source_html)
+        if kind is None:
+            return result
+        try:
+            browser = _sibling("browser_worker")
+        except Exception as exc:  # noqa: BLE001 - a missing worker stays on the free result
+            log(f"challenge worker unavailable: {type(exc).__name__}")
+            return result
+        if browser.playwright_session_factory() is None:
+            return result
+        return self._run_solver(result, canon, page, kind, source_html, browser)
+
+    def _challenge_name(self, result: FetchResult, source_html: str) -> str | None:
+        for text in (source_html, result.text or ""):
+            kind = paid_fetch.challenge_kind(text or "")
+            if kind in {"challenge_turnstile", "challenge_recaptcha"}:
+                return kind
+        if result.wall_kind in {"challenge_turnstile", "challenge_recaptcha"}:
+            return result.wall_kind
+        return None
+
+    def _run_solver(self, result, canon: str, page: Any, kind: str, source_html: str, browser) -> FetchResult:
+        """Wire one solver attempt. Returns the original result unless the browser actually got the page."""
+        del source_html
+        decision = self._load_solver_decision(canon, kind)
+        if decision is None or "solver" not in decision["modes"]:
+            return result
+        block = browser.activation_block_reason(
+            fixture_mode=True,
+            api_key=self.cfg.captcha_api_key,
+            allowed_modes=decision["modes"],
+            caps=decision["caps"],
+        )
+        if block:
+            log(f"challenge worker skipped: {block}")
+            return result
+        tariff = _captcha_tariff(decision["caps"])
+        if tariff <= 0:
+            return result
+        return self._run_solver_acquire(result, canon, page, kind, browser, decision, tariff)
+
+    def _run_solver_acquire(self, result, canon, page, kind, browser, decision, tariff: int) -> FetchResult:
+        captcha_mod = _sibling("captcha")
+        types = _sibling("fetch_types")
+        page_id = _page_id(page)
+        acquisition = f"solve-{page_id}-{hashlib.sha1(canon.encode()).hexdigest()[:12]}"
+        deadline = time.time() + float(self.cfg.captcha_deadline_sec)
+        request = types.AccessRequest(
+            acquisition_id=acquisition,
+            page_id=page_id,
+            url=canon,
+            private=False,
+            allowed_modes=decision["modes"],
+            approved_resource_origins=decision["origins"],
+            allowed_path_prefixes=decision["prefixes"],
+            session_id=acquisition,
+            deadline_at=deadline,
+        )
+        cfg = captcha_mod.SolverConfig(
+            client_key=self.cfg.captcha_api_key,
+            proxy_url=self.cfg.residential_proxy_url,
+        )
+        budget = sys.modules["snowball_paid_budget"]
+
+        def reservation_factory(_challenge):
+            return budget.reserve(
+                self.store,
+                acquisition,
+                "captcha",
+                tariff,
+                is_solver=True,
+                caps=decision["caps"],
+            )
+
+        solve = browser.solve_with_captcha(captcha_mod, self.store, cfg, reservation_factory)
+        egress = _sibling("egress_guard")
+        gateway = (
+            getattr(self, "egress_gateway", None)
+            or getattr(self, "gateway", None)
+            or getattr(self.cfg, "egress_gateway", None)
+        )
+        if gateway is None and hasattr(egress, "EgressGateway"):
+            try:
+                gateway = egress.EgressGateway(approved_origins=decision["origins"])
+            except Exception:
+                gateway = None
+        fetched = browser.acquire(
+            request,
+            cfg,
+            deadline,
+            session_factory=browser.playwright_session_factory(
+                approved_origins=decision["origins"],
+                gateway=gateway,
+            ),
+            solve=solve,
+        )
+        return self._adopt_browser_result(result, fetched)
+
+    def _load_solver_decision(self, canon: str, kind: str):
+        path = ROOT / "access.yml"
+        if not path.exists():
+            path = ROOT / "access.example.yml"
+        try:
+            loaded = access_policy.load_access_policy(path)
+            decision = loaded.decide(canon, private=False, wall_kind=kind)
+        except Exception as exc:  # noqa: BLE001 - policy failure denies the solver
+            log(f"challenge policy skipped: {type(exc).__name__}")
+            return None
+        return {
+            "modes": decision.allowed_modes,
+            "prefixes": decision.allowed_path_prefixes,
+            "origins": decision.approved_resource_origins,
+            "caps": loaded.caps(),
+        }
+
+    def _adopt_browser_result(self, original: FetchResult, fetched) -> FetchResult:
+        text = getattr(fetched, "text", "") or ""
+        if getattr(fetched, "outcome", None) != "ok" or len(text) < 200:
+            return original
+        return FetchResult(
+            original.canon,
+            "browser",
+            "ok",
+            getattr(fetched, "status", None) or 200,
+            getattr(fetched, "title", "") or "",
+            text,
+            nbytes=len(text.encode("utf-8")),
+            final_url=getattr(fetched, "final_url", None) or original.canon,
+        )
+
+    def _try_exa(self, canon: str) -> FetchResult | None:
+        if not self.exa_allowed():
+            return None
+        try:
+            body = json.dumps({"urls": [canon], "text": {"maxCharacters": 4000}}).encode()
+            request = urllib.request.Request(
+                f"{EXA_ROTATOR}/contents",
+                data=body,
+                method="POST",
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(request, timeout=60) as response:
+                payload = json.loads(response.read(self.cfg.max_body_bytes))
+        except Exception as exc:  # noqa: BLE001 - a contents miss stays on the free result
+            log(f"exa contents skipped: {type(exc).__name__}")
+            return None
+        parsed = paid_fetch.read_exa_contents(payload)
+        if parsed is None:
+            return None
+        title, text = parsed
+        return FetchResult(canon, "exa_contents", "ok", 200, title, text, final_url=canon)
+
+    def _try_paid(self, canon: str, private: bool, page: Any, policy_wall: str | None):
+        provider = (self.cfg.paid_provider or "").strip().lower()
+        if provider not in {"zenrows", "residential"}:
+            return None
+        policy_path = ROOT / "access.yml"
+        if not policy_path.exists():
+            policy_path = ROOT / "access.example.yml"
+        try:
+            loaded = access_policy.load_access_policy(policy_path)
+            context = self._paid_page(page)
+            return paid_fetch.maybe_escalate(
+                url=canon,
+                private=private,
+                wall_kind=policy_wall,
+                policy=loaded,
+                caps=loaded.caps(),
+                store=self.store,
+                cfg=paid_fetch.PaidConfig(
+                    provider=provider,
+                    zenrows_mode=self.cfg.zenrows_mode,
+                    zenrows_api_key=self.cfg.zenrows_api_key,
+                    residential_proxy_url=self.cfg.residential_proxy_url,
+                    min_yield=self.cfg.paid_min_yield,
+                    max_body_bytes=self.cfg.max_body_bytes,
+                    max_proxy_bytes=self.cfg.max_proxy_bytes,
+                    max_retrievals=self.cfg.max_paid_retrievals,
+                ),
+                page=context,
+                environ=os.environ,
+            )
+        except Exception as exc:  # noqa: BLE001 - paid failure must not crash the free collector
+            log(f"paid fetch skipped: {type(exc).__name__}")
+            return None
+
+    def _paid_page(self, page: Any):
+        if page is None:
+            return None
+        try:
+            page_id = int(page["id"])
+            domain = str(page["domain"])
+            kind = page["kind"] or page["predicted_kind"]
+        except (KeyError, TypeError, ValueError):
+            return None
+        stats = self.store.one(
+            "SELECT new_items_total, fetch_count, paid_failures FROM domains WHERE domain=?",
+            (domain,),
+        )
+        if stats is None:
+            return None
+        attempts = self.store.one("SELECT COUNT(*) AS n FROM paid_fetches WHERE page_id=?", (page_id,))
+        score = (int(stats["new_items_total"]) + 1) / (int(stats["fetch_count"]) + 2)
+        return paid_fetch.PageContext(
+            page_id=page_id,
+            domain=domain,
+            predicted_kind=str(kind) if kind else None,
+            yield_score=score,
+            paid_failures=int(stats["paid_failures"]),
+            paid_attempts=int(attempts["n"]) if attempts else 0,
+        )
 
     @staticmethod
     def _route_name(host: str) -> str:
@@ -1949,8 +3018,10 @@ class LockEngine:
         canon = canonical_url(raw)
         if not canon:
             return None
-        row = db.execute("SELECT id, raw_urls FROM pages WHERE canon_url=?", (canon,)).fetchone()
+        row = db.execute("SELECT id, raw_urls, status FROM pages WHERE canon_url=?", (canon,)).fetchone()
         if row:
+            if row["status"] == "dropped":
+                return None  # drift exclusion: dropped off-topic page cannot re-enter
             urls = json.loads(row["raw_urls"])
             if raw not in urls and len(urls) < 20:
                 urls.append(raw)
@@ -2029,7 +3100,31 @@ class LockEngine:
         year = key.rsplit("|", 1)[1]
         year = None if year == "-" else year
         existing = db.execute("SELECT * FROM entities WHERE key=?", (key,)).fetchone()
-        link = canonical_url(row["link"]) if row.get("link") else None
+        page_row = db.execute("SELECT canon_url, raw_path FROM pages WHERE id=?", (page_id,)).fetchone()
+        page_canon = page_row["canon_url"] if page_row else None
+        raw_link = row.get("link")
+        if not raw_link:
+            link = page_canon
+        else:
+            cand = canonical_url(raw_link)
+            # keep it only when that URL appears in the fetched page text or links
+            page_text = ""
+            if page_row and page_row["raw_path"]:
+                rp = ROOT / page_row["raw_path"]
+                if rp.exists():
+                    with contextlib.suppress(OSError):
+                        page_text = rp.read_text(errors="replace")
+            link_in_links = False
+            if cand:
+                found = db.execute(
+                    "SELECT 1 FROM page_links WHERE from_page_id=? AND to_canon_url=? LIMIT 1",
+                    (page_id, cand),
+                ).fetchone()
+                link_in_links = found is not None
+            if (cand and cand in page_text) or (raw_link in page_text) or link_in_links or (cand == page_canon):
+                link = cand
+            else:
+                link = None
         if not existing and link:
             is_hub = db.execute(
                 "SELECT 1 FROM pages p JOIN hubs h ON h.page_id=p.id WHERE p.canon_url=?", (link,)
@@ -2125,23 +3220,45 @@ class LockEngine:
         ts = now()
         nt = norm_text(text).casefold()
         h = hashlib.sha256(nt.encode()).hexdigest()
-        match = db.execute("SELECT hash FROM claims WHERE hash=?", (h,)).fetchone()
+        match = db.execute("SELECT hash, text FROM claims WHERE hash=?", (h,)).fetchone()
         verdict = "dup"
         if not match:
+            candidates = []
             q = self._rare_terms(db, nt)
             if q:
-                for c in db.execute(
-                    "SELECT c.hash, c.text FROM claims_fts f JOIN claims c ON c.rowid=f.rowid "
-                    "WHERE claims_fts MATCH ? ORDER BY bm25(claims_fts) LIMIT 50",
-                    (q,),
-                ):
-                    if hybrid_similarity(text, c["text"]) >= 0.70:
-                        match = c
+                try:
+                    candidates.extend(
+                        db.execute(
+                            "SELECT c.hash, c.text FROM claims_fts f JOIN claims c ON c.rowid=f.rowid "
+                            "WHERE claims_fts MATCH ? ORDER BY bm25(claims_fts) LIMIT 50",
+                            (q,),
+                        ).fetchall()
+                    )
+                except sqlite3.OperationalError:
+                    candidates = []
+            if not candidates:
+                candidates = db.execute(
+                    "SELECT hash, text FROM claims WHERE topic_id=? ORDER BY rowid DESC LIMIT 50",
+                    (topic_id,),
+                ).fetchall()
+            seen_hashes: set[str] = set()
+            for c in candidates:
+                if c["hash"] in seen_hashes:
+                    continue
+                seen_hashes.add(c["hash"])
+                if not numbers_compatible(text, c["text"]):
+                    continue  # conflicting amounts or years are material facts; never merge
+                sim = hybrid_similarity(text, c["text"])
+                # Shared amounts are the anchor; wording can drift below the general 0.70 bar.
+                threshold = 0.45 if material_numbers(text) else 0.70
+                if sim >= threshold:
+                    match = c
+                    if text != c["text"]:
                         db.execute(
                             "INSERT OR IGNORE INTO claim_variants(claim_hash, text) VALUES (?,?)", (c["hash"], text)
                         )
-                        verdict = "near_dup"
-                        break
+                    verdict = "near_dup"
+                    break
         if match:
             mh = match["hash"]
             seen_domain = db.execute(
@@ -2157,10 +3274,11 @@ class LockEngine:
             )
             self.metrics["claim_dup"] += 1
             return verdict
+        init_sources = 0 if reprint else 1
         db.execute(
-            "INSERT INTO claims(hash, text, norm_text, topic_id, entity_key, first_seen_at, last_seen_at) "
-            "VALUES (?,?,?,?,?,?,?)",
-            (h, text, nt, topic_id, entity, ts, ts),
+            "INSERT INTO claims(hash, text, norm_text, topic_id, entity_key, first_seen_at, last_seen_at, n_sources) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (h, text, nt, topic_id, entity, ts, ts, init_sources),
         )
         db.execute(
             "INSERT OR IGNORE INTO claim_sources(claim_hash, page_id, quote_start, quote_end) VALUES (?,?,?,?)",
@@ -2198,9 +3316,15 @@ class LockEngine:
     ) -> tuple[str, int]:
         """Returns (same|deepen|new, topic_id)."""
         key = key or slug(norm_name(title)[0] or title)
-        row = db.execute("SELECT id FROM topics WHERE key=?", (key,)).fetchone()
+        row = db.execute("SELECT id, private FROM topics WHERE key=?", (key,)).fetchone()
         if row:
-            return "same", row["id"]
+            if bool(row["private"]) == bool(private):
+                return "same", row["id"]
+            # Same slug on the other side of the privacy boundary is a different topic.
+            key = f"{key}-private" if private else f"{key}-public"
+            row = db.execute("SELECT id, private FROM topics WHERE key=?", (key,)).fetchone()
+            if row and bool(row["private"]) == bool(private):
+                return "same", row["id"]
         terms = topic_terms(title, focus)
         n_docs = db.execute("SELECT count(*) FROM topics").fetchone()[0]
         df = (
@@ -2311,13 +3435,13 @@ class SnowballOrchestrator:
         self.worker_id = f"orch-{os.getpid()}"
 
     # ---- seeding ----
-    def seed_from_yaml(self) -> int:
+    def seed_from_yaml(self, topics_path: Path | None = None) -> int:
         """topics.yml (or topics.example.yml) into families + topics. Idempotent via the topic lock."""
         try:
             import yaml
         except ImportError:
             return 0
-        path = ROOT / "topics.yml"
+        path = topics_path or ROOT / "topics.yml"
         if not path.exists():
             path = ROOT / "topics.example.yml"
         if not path.exists():
@@ -2343,7 +3467,8 @@ class SnowballOrchestrator:
                 f = fams.get(name) or {}
                 db.execute(
                     "INSERT INTO families(name, recheck_days, weight, relevance_floor, focus) VALUES (?,?,?,?,?) "
-                    "ON CONFLICT(name) DO NOTHING",
+                    "ON CONFLICT(name) DO UPDATE SET recheck_days=excluded.recheck_days, weight=excluded.weight, "
+                    "relevance_floor=excluded.relevance_floor, focus=excluded.focus",
                     (
                         name,
                         int(f.get("recheck_days", dd[0])),
@@ -2354,16 +3479,35 @@ class SnowballOrchestrator:
                 )
             for s in seeds:
                 sid = str(s["id"])
-                verdict, _ = self.locks.topic_lock(
+                key = slug(sid)
+                existing = db.execute("SELECT id FROM topics WHERE key=?", (key,)).fetchone()
+                verdict, topic_id = self.locks.topic_lock(
                     db,
                     s.get("title") or sid.replace("-", " "),
                     s["focus"],
                     s.get("family", "opportunities"),
                     "seed",
                     private=bool(s.get("private")),
-                    key=slug(sid),
+                    key=key,
                 )
-                added += verdict == "new"
+                if verdict == "new" or not existing:
+                    added += 1
+                    # Deterministic query grid: family x region x audience x source x window
+                    regions = s.get("regions") or ["india", "global"]
+                    audiences = s.get("audiences") or ["developers", "startups"]
+                    sources = ["exa", "hn", "arctic", "github"]
+                    if not s.get("private") and s.get("family", "opportunities") in ("alpha", "opportunities"):
+                        sources.append("grok")
+                    fam_info = fams.get(s.get("family", "opportunities")) or {}
+                    recheck_days = int(fam_info.get("recheck_days", 14))
+                    for reg in sorted(regions):
+                        for aud in sorted(audiences):
+                            for src in sorted(sources):
+                                raw_q = f"{s['focus']} {reg} {aud}"
+                                if self.dry:
+                                    self.router.planned.append(f"seed query [{src}]: {raw_q}")
+                                else:
+                                    self.locks.query_lock(db, raw_q, src, recheck_days, topic_id, via="seed")
         return added
 
     # ---- priority selection: Score = Novelty x Value x Due ----
@@ -2424,6 +3568,16 @@ class SnowballOrchestrator:
             ).fetchone()
         return r["occurrence_seq"] if r else None
 
+    def heartbeat(self, task_id: int, seq: int) -> bool:
+        """Heartbeat active task every 60s. Returns True if lease held, False if reaped/invalidated."""
+        with self.store.tx() as db:
+            cur = db.execute(
+                "UPDATE tasks SET heartbeat_at=strftime('%s','now') "
+                "WHERE id=? AND occurrence_seq=? AND status='claimed' AND worker_id=?",
+                (task_id, seq, self.worker_id),
+            )
+            return cur.rowcount == 1
+
     def finish_task(
         self,
         task_id: int,
@@ -2438,14 +3592,14 @@ class SnowballOrchestrator:
             if refund:  # outage: the attempt is refunded and the task waits for the window
                 cur = db.execute(
                     "UPDATE tasks SET status='pending', attempts=attempts-1, outage_pauses=outage_pauses+1, "
-                    "next_attempt_at=?, error=?, worker_id=NULL WHERE id=? AND occurrence_seq=?",
-                    (now() + retry_after, error, task_id, seq),
+                    "next_attempt_at=?, error=?, worker_id=NULL WHERE id=? AND occurrence_seq=? AND status='claimed' AND worker_id=?",
+                    (now() + retry_after, error, task_id, seq, self.worker_id),
                 )
             else:
                 cur = db.execute(
                     "UPDATE tasks SET status=CASE WHEN ?='failed' AND attempts<max_attempts THEN 'pending' ELSE ? END, "
-                    "result=?, error=?, next_attempt_at=strftime('%s','now')+60 WHERE id=? AND occurrence_seq=?",
-                    (status, status, json.dumps(result) if result is not None else None, error, task_id, seq),
+                    "result=?, error=?, next_attempt_at=strftime('%s','now')+60, worker_id=NULL WHERE id=? AND occurrence_seq=? AND status='claimed' AND worker_id=?",
+                    (status, status, json.dumps(result) if result is not None else None, error, task_id, seq, self.worker_id),
                 )
         return cur.rowcount == 1  # 0 rows: a reaper took the task while we worked; discard
 
@@ -2453,7 +3607,8 @@ class SnowballOrchestrator:
         with self.store.tx() as db:
             cur = db.execute(
                 "UPDATE tasks SET status=CASE WHEN attempts>=max_attempts THEN 'failed' ELSE 'pending' END, "
-                "error='reaped: heartbeat stale', worker_id=NULL, next_attempt_at=strftime('%s','now')+60 "
+                "error='reaped: heartbeat stale', worker_id=NULL, occurrence_seq=occurrence_seq+1, "
+                "next_attempt_at=strftime('%s','now')+60 "
                 "WHERE status='claimed' AND heartbeat_at < strftime('%s','now') - 600"
             )
             n = cur.rowcount
@@ -2464,7 +3619,26 @@ class SnowballOrchestrator:
             )
         return n
 
+    def commit_with_reclaimed_occurrence(self, old_seq: int, task_id: int | None = None) -> bool:
+        """Verify that attempting to commit side effects with a reclaimed occurrence sequence fails."""
+        with self.store.tx() as db:
+            if task_id is None:
+                row = db.execute(
+                    "SELECT 1 FROM tasks WHERE occurrence_seq=? AND status='claimed' AND worker_id=?",
+                    (old_seq, self.worker_id),
+                ).fetchone()
+            else:
+                row = db.execute(
+                    "SELECT 1 FROM tasks WHERE id=? AND occurrence_seq=? AND status='claimed' AND worker_id=?",
+                    (task_id, old_seq, self.worker_id),
+                ).fetchone()
+            return row is not None
+
     def new_task(self, db: sqlite3.Connection, kind: str, payload: dict, wave_id: int, priority: float = 0.5) -> int:
+        db.execute(
+            "INSERT INTO waves(id, started_at) VALUES (?, ?) ON CONFLICT(id) DO NOTHING",
+            (wave_id, now()),
+        )
         return db.execute(
             "INSERT INTO tasks(kind, payload, priority, next_attempt_at, wave_id, created_at) VALUES (?,?,?,?,?,?)",
             (kind, json.dumps(payload), priority, now(), wave_id, now()),
@@ -2474,7 +3648,7 @@ class SnowballOrchestrator:
     def run(self, max_topics: int, slug_filter: str | None) -> dict:
         if STOP_FILE.exists() and not self.dry:
             log("STOP file present; not running")
-            return {"stopped": True}
+            return {"stopped": True, "outcome": "stopped", "status": "stopped", "topics": []}
         reaped = self.reap()
         seeded = self.seed_from_yaml()
         topics = self.select_topics(max_topics, slug_filter)
@@ -2520,11 +3694,68 @@ class SnowballOrchestrator:
                 ),
             )
         summary["locks"] = dict(self.locks.metrics)
+        outcome = "ok"
+        if status == "budget_cut":
+            outcome = "budget-sleep"
+        elif status == "aborted":
+            outcome = "outage"
+        elif not any(x.get("fetched", 0) for x in summary["topics"]):
+            outcome = "dry-frontier"
+        summary["outcome"] = outcome
+        summary["status"] = outcome
+
+        # Post-wave wiki compile and urgent alerts
+        if not self.dry:
+            try:
+                compiler = _sibling("wiki_compiler")
+                compile_res = compiler.compile_wiki(self.store.db, ROOT / "wiki", full=False)
+                summary["wiki_compile"] = compile_res
+            except Exception as e:
+                log(f"post-wave wiki compile error: {e}")
+            try:
+                alerts_mod = _sibling("alerts")
+                alert_res = alerts_mod.send_urgent_alerts(self.store.db, self.cfg.discord_channel_id or "")
+                summary["alerts"] = alert_res
+            except Exception as e:
+                log(f"post-wave alert dispatch error: {e}")
+
         if self.dry:
             summary["planned_calls"] = (
                 self.router.planned + self.gemini.planned + self.grok.planned + self.local.planned
             )
         return summary
+
+    def supervise(self, max_topics: int = 1, interval_sec: int = 60) -> int:
+        """Persistent supervisor loop with machine-readable status & bounded sleeps."""
+        log(f"Starting Snowball supervisor loop (pid {os.getpid()})")
+        while True:
+            if STOP_FILE.exists():
+                log("STOP file present; supervisor stopping")
+                return 0
+            try:
+                res = self.run(max_topics, None)
+                outcome = res.get("outcome", "ok")
+                log(f"Supervisor wave finished: outcome={outcome}")
+                if outcome == "stopped":
+                    return 0
+                elif outcome == "budget-sleep":
+                    sleep_time = min(1800, interval_sec * 5)
+                    log(f"Budget sleep for {sleep_time}s")
+                    time.sleep(sleep_time)
+                elif outcome == "dry-frontier":
+                    log("Dry frontier; sleeping 1800s")
+                    time.sleep(min(1800, interval_sec * 30))
+                elif outcome == "outage":
+                    log("Outage detected; sleeping 900s")
+                    time.sleep(min(900, interval_sec * 15))
+                else:
+                    time.sleep(interval_sec)
+            except KeyboardInterrupt:
+                log("Supervisor interrupted by user")
+                return 0
+            except Exception as e:
+                log(f"Supervisor loop error: {e}")
+                time.sleep(interval_sec)
 
     # ---- Wave 0: KB-first ----
     def seed_queries(self, run: TopicRun) -> list[tuple[str, str, int | None]]:
@@ -2578,6 +3809,33 @@ class SnowballOrchestrator:
                     db.execute("UPDATE queries SET name_id=? WHERE id=?", (name_id, qid))
                 if qid:
                     run.queries.append(db.execute("SELECT * FROM queries WHERE id=?", (qid,)).fetchone())
+        # Consume pending deepen tasks
+        deepen_tasks = self.store.all(
+            "SELECT id, payload FROM tasks WHERE kind='deepen' AND status='pending' AND json_extract(payload, '$.topic_id')=? LIMIT 2",
+            (t["id"],),
+        )
+        for dt in deepen_tasks:
+            try:
+                pl = json.loads(dt["payload"])
+                dfocus = pl.get("focus")
+                if dfocus:
+                    with self.store.tx() as db:
+                        qid = self.locks.query_lock(db, dfocus, "exa", days, t["id"], via="name")
+                        if qid:
+                            run.queries.append(db.execute("SELECT * FROM queries WHERE id=?", (qid,)).fetchone())
+                        db.execute("UPDATE tasks SET status='done' WHERE id=?", (dt["id"],))
+            except Exception as e:
+                log(f"deepen task error: {e}")
+
+        # Replay paused/pending queries
+        existing_pending = self.store.all(
+            "SELECT * FROM queries WHERE topic_id=? AND status='pending' AND scheduled_at <= strftime('%s','now') LIMIT 4",
+            (t["id"],),
+        )
+        have_qids = {q["id"] for q in run.queries}
+        for ep in existing_pending:
+            if ep["id"] not in have_qids:
+                run.queries.append(ep)
         log(
             f"[{t['key']}] wave0: {len(run.queries)} queries to run, {run.kb_answered} answered by the KB, "
             f"{self.locks.metrics['query_dup']} locked"
@@ -2642,7 +3900,15 @@ class SnowballOrchestrator:
         with ThreadPoolExecutor(max_workers=max(1, self.cfg.collector_concurrency)) as ex:
             results = list(
                 ex.map(
-                    lambda p: (p, self.router.fetch(json.loads(p["raw_urls"])[0], hits_by_canon.get(p["canon_url"]))),
+                    lambda p: (
+                        p,
+                        self.router.fetch(
+                            json.loads(p["raw_urls"])[0],
+                            hits_by_canon.get(p["canon_url"]),
+                            private=run.private,
+                            page=p,
+                        ),
+                    ),
                     pops,
                 )
             )
@@ -2661,7 +3927,7 @@ class SnowballOrchestrator:
                  f.weight * CASE COALESCE(p.kind, p.predicted_kind, 'unsure') WHEN 'hub' THEN 1.0 WHEN 'item' THEN 0.9
                                  WHEN 'article' THEN 0.5 ELSE 0.6 END
                    * (COALESCE(pp.new_items_total, 0) + 1.0) / (COALESCE(pp.fetch_count, 0) + 2.0)
-                   * (1.0 + 0.2 * d.feedback_score) AS value,
+                   * MAX(0.1, 1.0 + 0.2 * d.feedback_score) AS value,
                  1.0 + MIN(1.0, (strftime('%s','now') - p.next_check_at) / 86400.0) AS due
             FROM pages p
             JOIN domains d ON d.domain = p.domain
@@ -2685,20 +3951,139 @@ class SnowballOrchestrator:
             out.append(r)
             if len(out) >= n:
                 break
+        if len(out) < 4:
+            added = self.refill_frontier(topic_id)
+            if added > 0:
+                # Reselect from frontier so newly enqueued pages are popped and not ignored
+                re_rows = self.store.all(
+                    """
+                WITH cand AS (
+                  SELECT p.id, p.domain, p.canon_url, p.raw_urls, p.status, p.fetch_count, p.topic_id,
+                         CASE WHEN p.fetch_count = 0
+                              THEN MAX(0.3, 1.0 - 0.02 * d.fetch_count) * (CASE WHEN d.junk_count > 0 THEN 0.5 ELSE 1.0 END)
+                              ELSE (COALESCE(h.rows_added_total, 0) + 1.0) / (p.fetch_count + 2.0) END AS novelty,
+                         f.weight * CASE COALESCE(p.kind, p.predicted_kind, 'unsure') WHEN 'hub' THEN 1.0 WHEN 'item' THEN 0.9
+                                         WHEN 'article' THEN 0.5 ELSE 0.6 END
+                           * (COALESCE(pp.new_items_total, 0) + 1.0) / (COALESCE(pp.fetch_count, 0) + 2.0)
+                           * MAX(0.1, 1.0 + 0.2 * d.feedback_score) AS value,
+                         1.0 + MIN(1.0, (strftime('%s','now') - p.next_check_at) / 86400.0) AS due
+                    FROM pages p
+                    JOIN domains d ON d.domain = p.domain
+                    LEFT JOIN topics t ON t.id = p.topic_id
+                    JOIN families f ON f.name = COALESCE(t.family, 'opportunities')
+                    LEFT JOIN hubs h ON h.page_id = p.id
+                    LEFT JOIN pages pp ON pp.id = p.parent_page_id
+                   WHERE p.status IN ('queued','scheduled') AND p.topic_id = ?
+                     AND p.next_check_at <= strftime('%s','now')
+                     AND (p.next_attempt_at IS NULL OR p.next_attempt_at <= strftime('%s','now'))
+                     AND d.status = 'ok' AND (d.paused_until IS NULL OR d.paused_until <= strftime('%s','now')))
+                SELECT *, novelty * value * due AS score FROM cand ORDER BY score DESC LIMIT ?""",
+                    (topic_id, n * 4),
+                )
+                re_dom: Counter = Counter()
+                re_out = []
+                for r in re_rows:
+                    if re_dom[r["domain"]] >= 4:
+                        continue
+                    re_dom[r["domain"]] += 1
+                    re_out.append(r)
+                    if len(re_out) >= n:
+                        break
+                if len(re_out) > len(out):
+                    return re_out
         return out
 
-    def record_fetch(self, run: TopicRun, p: sqlite3.Row, r: FetchResult) -> None:
-        """Fetch record, outage/failure split (4.7), walls (4.6), then page locks 2b/2c and quarantine."""
+    def refill_frontier(self, topic_id: int) -> int:
+        """Fill dry frontier when < 4 pages are due (docs/SYSTEM_DESIGN.md section 6.8):
+        1. Exa findSimilar on top-5 high-yield hubs under reserve
+        2. Backlink discovery from page_links
+        3. Name snowball from pending names
+        """
+        added = 0
+        topic = self.store.one("SELECT * FROM topics WHERE id=?", (topic_id,))
+        if not topic:
+            return 0
+        days = 14
+        top_hubs = self.store.all(
+            "SELECT p.id, p.canon_url FROM hubs h JOIN pages p ON p.id=h.page_id "
+            "WHERE p.topic_id=? ORDER BY h.rows_added_total DESC LIMIT 5",
+            (topic_id,),
+        )
+        # 1. Exa findSimilar under reserve
+        if top_hubs and self.router.exa_allowed():
+            for hub in top_hubs:
+                try:
+                    similar_hits = self.router.find_similar(hub["canon_url"])
+                    for hit in similar_hits:
+                        with self.store.tx() as db:
+                            pid = self.locks.enqueue_url(db, hit.url, topic_id, "similar", days, parent=hub["id"])
+                            if pid:
+                                added += 1
+                except Exception as e:
+                    log(f"findSimilar error for {hub['canon_url']}: {e}")
+        # 2. Backlink discovery
+        if top_hubs and added < 4:
+            hub_canons = [h["canon_url"] for h in top_hubs]
+            placeholders = ",".join("?" * len(hub_canons))
+            backlink_rows = self.store.all(
+                f"SELECT DISTINCT p.canon_url FROM page_links pl "
+                f"JOIN pages p ON p.id=pl.from_page_id "
+                f"WHERE pl.to_canon_url IN ({placeholders}) AND p.id NOT IN (SELECT page_id FROM hubs)",
+                tuple(hub_canons),
+            )
+            for bl in backlink_rows:
+                with self.store.tx() as db:
+                    pid = self.locks.enqueue_url(db, bl["canon_url"], topic_id, "backlink", days)
+                    if pid:
+                        added += 1
+        # 3. Name snowball
+        if added < 4:
+            pending_names = self.store.all(
+                "SELECT n.id, n.raw, p.domain FROM names n JOIN pages p ON p.id=n.first_page_id "
+                "WHERE n.topic_id=? AND n.status='pending' ORDER BY p.new_items_total DESC LIMIT 5",
+                (topic_id,),
+            )
+            for pn in pending_names:
+                with self.store.tx() as db:
+                    qid = self.locks.query_lock(db, pn["raw"], "exa", days, topic_id, via="name")
+                    if qid:
+                        db.execute("UPDATE names SET status='searched', searched_at=? WHERE id=?", (now(), pn["id"]))
+                        added += 1
+        return added
+
+    def record_fetch(
+        self,
+        run: TopicRun,
+        p: sqlite3.Row,
+        r: FetchResult,
+        task_id: int | None = None,
+        occurrence_seq: int | None = None,
+    ) -> None:
+        """Fetch record, outage/failure split (4.7), walls (4.6), then page locks 2b/2c, classification, drift, hubs."""
         ts, pid, dom = now(), p["id"], p["domain"]
-        route = r.route if r.route in ("direct", "exa_contents", "arctic", "hn", "github", "grok", "feed") else "direct"
+        known_routes = {"direct", "exa_contents", "zenrows", "resi_proxy", "arctic", "hn", "github", "grok", "feed", "browser"}
+        route = r.route if r.route in known_routes else "direct"
         if self.dry:
             run.pages.append({"page_id": pid, "result": r, "reprint": False, "domain": dom})
             return
         with self.store.tx() as db:
-            db.execute(
+            if task_id is not None:
+                valid = db.execute(
+                    "SELECT 1 FROM tasks WHERE id=? AND occurrence_seq=? AND status='claimed' AND worker_id=?",
+                    (task_id, occurrence_seq, self.worker_id),
+                ).fetchone()
+                if not valid:
+                    return  # Stale worker lease; zero writes allowed
+            cur_f = db.execute(
                 "INSERT INTO fetches(page_id, at, route, http_status, bytes, ms, outcome, pinned_ip, due) "
                 "VALUES (?,?,?,?,?,?,?,?,1)",
                 (pid, ts, route, r.status, r.nbytes or len(r.text), r.ms, r.outcome, r.pinned_ip),
+            )
+            fetch_id = cur_f.lastrowid
+            db.execute(
+                "INSERT INTO access_attempts(fetch_id, page_id, mode, route, status, http_status, bytes, ms, error, at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (fetch_id, pid, getattr(r, "mode", "direct"), route, r.outcome, r.status, r.nbytes or len(r.text), r.ms, None if r.outcome == "ok" else r.outcome, ts),
             )
             db.execute(
                 "INSERT INTO budgets(day, fetches) VALUES (?,1) ON CONFLICT(day) DO UPDATE SET fetches=fetches+1",
@@ -2775,6 +4160,22 @@ class SnowballOrchestrator:
                     fh.write(f"- {datetime.now(IST):%Y-%m-%d %H:%M} {p['canon_url']} ({', '.join(hits)}) {raw_path}\n")
                 run.counts["quarantined"] += 1
                 return
+
+            # Classification
+            kind = classify_page(r.title, r.text, p["canon_url"], r.links, engine=None)
+            db.execute("UPDATE pages SET kind=? WHERE id=?", (kind, pid))
+
+            # Family drift floor
+            fam_focus = run.family["focus"] if "focus" in run.family.keys() else ""
+            relevance = compute_family_relevance(r.title, r.text, fam_focus)
+            db.execute("UPDATE pages SET relevance=? WHERE id=?", (relevance, pid))
+            floor = float(run.family["relevance_floor"] if "relevance_floor" in run.family.keys() else 0.08)
+            if relevance < floor:
+                db.execute("UPDATE pages SET status='dropped' WHERE id=?", (pid,))
+                run.counts["drift_dropped"] = run.counts.get("drift_dropped", 0) + 1
+                return  # off-topic: dropped and cannot expand links
+
+            # Content locks (same / alias / reprint)
             verdict, other = self.locks.content_lock(db, pid, r.text)
             if verdict == "same":
                 db.execute(
@@ -2790,8 +4191,87 @@ class SnowballOrchestrator:
                 return
             if verdict == "reprint":
                 db.execute("UPDATE pages SET status='reprint', reprint_of=? WHERE id=?", (other, pid))
-            if p["fetch_count"]:  # a changed re-check: halve the interval (I6)
+                for i, (href, anchor) in enumerate(r.links[:400]):
+                    c = canonical_url(urljoin(r.final_url or p["canon_url"], href))
+                    if c and c != p["canon_url"]:
+                        db.execute(
+                            "INSERT OR IGNORE INTO page_links(from_page_id, to_canon_url, anchor, position) "
+                            "VALUES (?,?,?,?)",
+                            (pid, c, anchor[:200], i),
+                        )
+                return  # reprints suppress model extraction
+
+            if p["fetch_count"] and kind != "hub":  # a changed re-check: halve the interval (I6)
                 db.execute("UPDATE pages SET interval_sec=MAX(interval_sec/2, 6*3600) WHERE id=?", (pid,))
+
+            # Pure hub row extraction and diffs. The first sight is a baseline: record rows,
+            # do not enqueue them, and do not change the interval. Later sights enqueue only
+            # rows that were not in that baseline, and only those shorten the interval.
+            if kind == "hub":
+                db.execute("INSERT INTO hubs(page_id) VALUES (?) ON CONFLICT(page_id) DO NOTHING", (pid,))
+                existing_rows = {
+                    row["row_hash"]: row for row in db.execute(
+                        "SELECT row_hash, to_canon_url, anchor FROM hub_rows WHERE hub_page_id=?", (pid,)
+                    ).fetchall()
+                }
+                baseline = not existing_rows
+                seen_now = set()
+                new_hub_rows = []
+                for href, anchor in (r.links or []):
+                    c = canonical_url(urljoin(r.final_url or p["canon_url"], href))
+                    if c and c != p["canon_url"]:
+                        norm_a = norm_text(anchor or "")
+                        r_hash = hashlib.sha1(f"{c}|{norm_a}".encode()).hexdigest()
+                        seen_now.add(r_hash)
+                        if r_hash not in existing_rows:
+                            new_hub_rows.append((pid, r_hash, c, norm_a[:200], ts, ts))
+                            if not baseline:
+                                self.locks.enqueue_url(db, c, p["topic_id"], "hub", run.family["recheck_days"], parent=pid)
+                        else:
+                            db.execute("UPDATE hub_rows SET last_seen_at=? WHERE hub_page_id=? AND row_hash=?", (ts, pid, r_hash))
+                if new_hub_rows and not baseline:
+                    db.executemany(
+                        "INSERT OR IGNORE INTO hub_rows(hub_page_id, row_hash, to_canon_url, anchor, first_seen_at, last_seen_at) "
+                        "VALUES (?,?,?,?,?,?)",
+                        new_hub_rows,
+                    )
+                    db.execute(
+                        "UPDATE pages SET interval_sec=MAX(interval_sec/2, 6*3600), "
+                        "next_check_at=? + MAX(interval_sec/2, 6*3600), status='scheduled' WHERE id=?",
+                        (ts, pid),
+                    )
+                    db.execute(
+                        "UPDATE hubs SET item_count=?, rows_added_total=rows_added_total+?, last_diff_at=? WHERE page_id=?",
+                        (len(seen_now), len(new_hub_rows), ts, pid),
+                    )
+                    run.counts["hub_new_rows"] = run.counts.get("hub_new_rows", 0) + len(new_hub_rows)
+                elif new_hub_rows and baseline:
+                    db.executemany(
+                        "INSERT OR IGNORE INTO hub_rows(hub_page_id, row_hash, to_canon_url, anchor, first_seen_at, last_seen_at) "
+                        "VALUES (?,?,?,?,?,?)",
+                        new_hub_rows,
+                    )
+                    db.execute(
+                        "UPDATE pages SET status='scheduled', next_check_at=? + interval_sec WHERE id=?",
+                        (ts, pid),
+                    )
+                    db.execute(
+                        "UPDATE hubs SET item_count=?, last_diff_at=? WHERE page_id=?",
+                        (len(seen_now), ts, pid),
+                    )
+                else:
+                    db.execute(
+                        "UPDATE pages SET interval_sec=MIN(interval_sec*2, 90*86400), "
+                        "next_check_at=? + MIN(interval_sec*2, 90*86400), status='scheduled' WHERE id=?",
+                        (ts, pid),
+                    )
+                    db.execute(
+                        "UPDATE hubs SET item_count=?, last_diff_at=? WHERE page_id=?",
+                        (len(seen_now), ts, pid),
+                    )
+                    run.counts["hub_unchanged"] = run.counts.get("hub_unchanged", 0) + 1
+                return  # Hubs use code-defined row extraction; do NOT extract via LLM
+
             for i, (href, anchor) in enumerate(r.links[:400]):
                 c = canonical_url(urljoin(r.final_url or p["canon_url"], href))
                 if c and c != p["canon_url"]:
@@ -2800,9 +4280,8 @@ class SnowballOrchestrator:
                         "VALUES (?,?,?,?)",
                         (pid, c, anchor[:200], i),
                     )
-        run.pages.append({"page_id": pid, "result": r, "reprint": verdict == "reprint", "domain": dom})
+        run.pages.append({"page_id": pid, "result": r, "reprint": False, "domain": dom})
         run.counts["fetched"] += 1
-
     # ---- Wave 2: extraction ----
     def load_leftovers(self, run: TopicRun) -> None:
         """Pages fetched by an earlier run whose extraction was deferred (outage, engine down) rejoin here."""
@@ -2895,7 +4374,7 @@ class SnowballOrchestrator:
                     run.deferred.add(pid)  # failure: a strike; the third lets wave 4 schedule it unextracted
                 run.counts["extract_failed"] += 1
                 continue
-            guarded = substring_guard(data, source)
+            guarded = validate_extraction(data, source, fallback_url=pg["result"].canon)
             run.extractions[pid] = {"data": guarded, "source": source, "engine": engine.name}
             run.counts["rows_extracted"] += len(guarded["rows"])
             run.counts["rows_guard_dropped"] += guarded["dropped"]
@@ -3337,10 +4816,39 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--status", action="store_true", help="frontier, token spend, domain yield")
     ap.add_argument("--json", action="store_true", help="print the result as JSON")
     ap.add_argument("--seed-only", action="store_true", help="seed topics and exit")
-    ap.add_argument("--db", type=Path, default=DB_PATH, help=argparse.SUPPRESS)
+    ap.add_argument("--topics", type=Path, default=None, help="path to custom topics YAML file")
+    ap.add_argument("--run-once", action="store_true", help="run one topic wave and exit with machine-readable outcome")
+    ap.add_argument("--supervise", action="store_true", help="run supervisor persistent loop with bounded sleeps")
+    ap.add_argument("--diagnose", action="store_true", help="run provider diagnostic availability checks")
+    ap.add_argument("--live", action="store_true", help="perform live bounded completions during diagnostics")
+    ap.add_argument("--db", type=Path, default=DB_PATH, help="path to snowball.db")
     a = ap.parse_args(argv)
     cfg = load_config()
-    store = Store.open(a.db)
+
+    if a.diagnose:
+        diag = diagnose_providers(cfg, live=a.live)
+        if a.json:
+            print(json.dumps(diag, indent=1, default=str))
+        else:
+            print("Snowball Provider Diagnostics:")
+            for p, st in diag.items():
+                if p == "all_ok":
+                    continue
+                print(f"  {p:<8} status={st.get('status')} error={st.get('error', 'none')}")
+        return 0 if diag.get("all_ok") else 1
+
+    if a.dry_run and a.seed_only:
+        store = Store.in_memory()
+    elif a.dry_run:
+        if a.db.exists():
+            # Open a copy. Store.open migrates schema_meta, and that must not rewrite the caller's file.
+            copy = Path(tempfile.mkdtemp(prefix="snowball-dry-")) / "dry.db"
+            shutil.copy2(a.db, copy)
+            store = Store.open(copy).snapshot()
+        else:
+            store = Store.in_memory()
+    else:
+        store = Store.open(a.db)
     orch = SnowballOrchestrator(cfg, store, mode=a.mode or cfg.mode, dry=a.dry_run)
     if a.status:
         st = orch.status()
@@ -3350,10 +4858,16 @@ def main(argv: list[str] | None = None) -> int:
             print_status(st)
         return 0
     if a.seed_only:
-        n = orch.seed_from_yaml()
-        print(f"seeded {n} topics")
+        n = orch.seed_from_yaml(topics_path=a.topics)
+        if a.json:
+            print(json.dumps({"seeded": n, "planned_calls": orch.router.planned}, indent=1))
+        else:
+            print(f"seeded {n} topics {'(dry-run in-memory)' if a.dry_run else ''}")
         return 0
-    lock_path = a.db.parent / "orchestrator.lock"
+    if a.supervise:
+        return orch.supervise(a.max_topics or 1)
+    lock_path = (a.db.parent if not isinstance(store.db, sqlite3.Connection) or a.db.exists() else ROOT / "data") / "orchestrator.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
     with open(lock_path, "a") as fh:
         try:
             _flock_nb(fh)  # one batch at a time; the DB is single-writer anyway
@@ -3371,7 +4885,6 @@ def main(argv: list[str] | None = None) -> int:
         for c in summary.get("planned_calls", []):
             print(f"  would call: {c}")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

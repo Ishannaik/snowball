@@ -178,9 +178,9 @@ class TestSnowballE2E(unittest.TestCase):
     def test_02_ask_engine_semantic_retrieval(self):
         """Verify snowball ask finds matching entities and formatted claims."""
         conn = sqlite3.connect(self.db_path)
-        evidence = ask_mod.search_local_knowledge(conn, "Mozilla grants", limit=5)
+        wiki_mod.compile_wiki(conn, self.wiki_dir)
+        evidence = ask_mod.search_local_knowledge(conn, "Mozilla grants", wiki_dir=self.wiki_dir, limit=5)
         conn.close()
-
         self.assertGreaterEqual(len(evidence["entities"]), 1)
         self.assertEqual(evidence["entities"][0]["name"], "Mozilla Technology Fund")
         self.assertEqual(evidence["entities"][0]["currency"], "USD")
@@ -264,6 +264,12 @@ class TestSnowballE2E(unittest.TestCase):
         self.assertEqual(p_vis.returncode, 0)
         self.assertIn("TERMINAL DASHBOARD", p_vis.stdout)
 
+
+    def test_07_supervisor_outcomes(self):
+        """Verify supervisor machine-readable outcomes."""
+        summary = self.orchestrator.run(1, None)
+        self.assertIn("outcome", summary)
+        self.assertIn(summary["outcome"], {"ok", "dry-frontier", "budget-sleep", "outage", "stopped"})
 
 if __name__ == "__main__":
     unittest.main()

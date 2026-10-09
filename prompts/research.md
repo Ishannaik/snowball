@@ -32,7 +32,7 @@ FORUM={{FORUM_PY}}
    python3 $FORUM gh-search "query" --discussions
 6. Discourse forums (for example discuss.huggingface.co, discuss.pytorch.org, forum.cursor.com):
    python3 $FORUM discourse discuss.huggingface.co "query"
-7. Any page as text. Add --camoufox ONLY when a page returns 403 "Just a moment" (Cloudflare). It is slow:
+7. Any page as text via the free fetch path. Camoufox is inherited and is not the supported challenge path; it stays until owned Turnstile and reCAPTCHA fixtures pass, and it does not bypass access policy:
    python3 $FORUM fetch <url>
 8. web_search tool: for leads and official program pages only, at most {{EXA_LEFT}} calls in this run
    (0 means do not call it). Then read the forum threads it points to.

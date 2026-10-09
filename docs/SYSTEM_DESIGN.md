@@ -1,10 +1,11 @@
 # Snowball System Design Specification
 
-**Version:** 1.0 (definitive)
-**Date:** 2026-10-06
+**Version:** 1.1 (access amendment and gate-evidence policy)
+**Date:** 2026-10-08
 **Repo:** `github.com/Ishannaik/snowball` (private), checkout at `~/repos/snowball`
-**Supersedes:** `DESIGN.md` (crawl tree, v0), `PLAN.md` (feature list), both kept as history.
-**Inputs:** the v0 fork, the 8-agent competitor audit in `COMPETITOR_DEEP_DIVE.md` and `FEATURE_MATRIX.md`, and the host facts measured on 2026-10-06 (goku: aarch64, 4 cores, 11.8 GB available RAM, 84 GB free disk, SQLite 3.45.1; oracle: SQLite 3.45.1, curl_cffi 0.15.0 with `CurlOpt.RESOLVE`, default impersonation profile `chrome146`).
+**Supersedes:** `DESIGN.md` (crawl tree, v0). `PLAN.md` remains the feature list and now points at this amendment.
+**Gate status:** section 9.1 and `data/gate-evidence.jsonl`. A verified ledger row is the only completion record for a gate.
+**Inputs:** the v0 fork, the 8-agent competitor audit in `COMPETITOR_DEEP_DIVE.md` and `FEATURE_MATRIX.md`, and the host facts measured on 2026-10-06 (goku: aarch64, 4 cores, 11.8 GB available RAM, 84 GB free disk, SQLite 3.45.1; oracle: SQLite 3.45.1, curl_cffi 0.15.0 with `CurlOpt.RESOLVE`, default impersonation profile `chrome146`). Those free-memory and free-disk figures are historical measurements, not deployment evidence. Measure the host again at deployment.
 
 ---
 
@@ -30,7 +31,7 @@
 
 ### 1.1 What Snowball is
 
-Snowball is a research agent that runs 24 hours a day on the `goku` VPS. It builds and maintains its own knowledge base: a Markdown wiki that is the source of truth, plus a SQLite database that holds the crawl frontier, the no-repeat locks and a rebuildable full-text index. It looks for grants, hackathons, startup funding, free GPU and cloud credits, competitor moves and early "alpha" about AI tools. Nobody approves its work. Once a day it posts a Discord digest that contains only what is new or changed since the last digest.
+Snowball is a research agent that runs 24 hours a day on the `goku` VPS. It builds and maintains its own knowledge base: a Markdown wiki that is the source of truth, plus a SQLite database that holds the crawl frontier, the no-repeat locks and a rebuildable full-text index. It looks for grants, hackathons, startup funding, free GPU and cloud credits, competitor moves and early "alpha" about AI tools. Nobody approves its work. Once a day it posts a Discord digest that contains only what is new or changed since the last digest. Managed fetching, residential proxies, and CAPTCHA solving are outside the default loop. Section 4 states when an operator may activate them for authorized public pages. Writing that code is feature implementation. Calling a provider is a separate activation step.
 
 ### 1.2 The problem it solves
 
@@ -59,20 +60,23 @@ These hold at every milestone. A change that breaks one is a design change, not 
 | I1 | **Code seeds, the web supplies.** After day one, every query in `queries` has a `discovered_via` of `hub`, `name`, `backlink` or `similar`, never `llm`. | `queries.discovered_via` CHECK constraint, section 5 |
 | I2 | **The LLM never judges novelty.** New / changed / same is decided by the lock engine before any model sees the item. | Section 3 pipeline order |
 | I3 | **The model has no tools.** Text in, JSON out. Code fetches, code writes. Nothing a page says can execute. | `tools/llm.py`, section 6.5 |
-| I4 | **Never fight a wall.** A login wall, captcha, Cloudflare challenge or robots disallow marks the page `walled` and the crawler moves on. No stealth browsers, no captcha solving. Paid offload is opt-in and budget-capped. | Section 4 |
+| I4 | **Authorized public access only.** Configured managed fetch, a residential proxy, and a CAPTCHA provider may retrieve operator-approved public research pages. Escalation is domain-scoped, cost-capped, and time-bounded. A login wall, paywall, robots exclusion, explicit access denial, or rate-limit ban is terminal or a cooldown, not a reason to rotate identity or keep paying. Feature implementation does not activate a provider: paid execution stays off until credentials, a current tariff, nonzero ceilings, and an `access.yml` allowlist all exist. Shipped secret-free configuration keeps paid ceilings at zero. A missing prerequisite is `blocked`. | Section 4 |
 | I5 | **Every extracted fact carries an evidence quote found verbatim in the fetched page.** A fact without a passing quote is dropped, not softened. | Section 7.4 |
 | I6 | **Re-check means diff, not redo.** A due page is re-fetched, hashed, and only its new rows enter the pipeline. | Section 3.2, 4.6 |
 | I7 | **Markdown is truth, SQLite indexes are rebuildable.** `wiki/` can rebuild `wiki_*` tables and FTS5 at any time. The frontier and lock tables are authoritative and backed up. | Section 8.1 |
 | I8 | **Budgets sleep, they never fail.** Exa reserve, token budget, per-domain rate, paid fetch cap and memory cap all pause work and resume when the window opens. | Section 6.4 |
-| I9 | **Zero PyTorch, zero FAISS, zero headless browser by default.** Pure Python, SQLite FTS5, BM25 and TF-IDF do the ranking. | Section 7.3, 3.5 |
+| I9 | **Zero PyTorch, zero FAISS, no headless browser on the default fetch path.** Pure Python, SQLite FTS5, BM25 and TF-IDF do the ranking. A separate one-context challenge worker is outside that path and stays off until provider activation. | Section 7.3, 3.5, 4.1 |
 | I10 | **Only new or changed reaches a human.** A digest line is an `entities` row with `reported_at IS NULL`, or an `entity_changes` row with `reported_at IS NULL`, and nothing else. | Section 8.6 |
 
 ### 1.5 Non-goals
 
-- No solving captchas, no bypassing bot walls, no logins, no form fills.
+- Public pages only. Managed fetch, residential proxy, and CAPTCHA solving apply only to exact origins and path prefixes in `access.yml`, and only for supported public challenges: standalone Turnstile, Turnstile challenge flows, and reCAPTCHA v2. Any other challenge family is `unsupported_challenge`. A solver token is not proof of access.
+- No login bypass, no paywall bypass, no purchase or application actions, no use of operator credentials on target sites, and no circumvention of an explicit access denial. Robots exclusions are final. HTTP 429 is a cooldown, not paid identity rotation.
 - No crawling of leak, warez or credential sites.
-- No acting on findings: Snowball never applies, posts or emails.
-- No approval queue. Human feedback is optional and only adjusts scores.
+- No acting on findings: Snowball never applies, posts, purchases, or emails.
+- No per-page approval queue. Domain policy is operator configuration, not a queue. Human feedback is optional and only adjusts scores.
+- Private topics stay on local models. They never use an external paid fetcher, a solver, or a public model endpoint.
+- No treating a green unit suite, a fixture file, an empty result, a missing provider key, or an existing git tag as completion of the Fable gates. Section 9.1 is the status rule.
 
 ---
 
@@ -125,6 +129,10 @@ These hold at every milestone. A change that breaks one is a design change, not 
                        direct HTTPS via curl_cffi · optional ZenRows / residential proxy (opt-in)
 ```
 
+The diagram is the free path plus Oracle's model and Exa services. Managed fetch, residential proxy, and the challenge worker are specified in section 4. Code for those routes is feature implementation. Provider activation is separate: credentials, a current tariff, nonzero ceilings, and an `access.yml` allowlist. Historical RAM and disk figures in the diagram and the header are measurements from 2026-10-06, not deployment evidence. Production state stays on goku. Oracle supplies model and Exa services and does not hold Snowball state. Verify usable model IDs at deployment. Do not swap in a paid GPU alias to force a smoke pass.
+
+Private topics stay on local models. They never use an external paid fetcher, a solver, or a public model endpoint.
+
 ### 2.2 Subsystem boundaries
 
 | Subsystem | Module | Owns | Never does |
@@ -141,6 +149,8 @@ These hold at every milestone. A change that breaks one is a design change, not 
 | Compiler | `snowball/compiler.py` | Incremental Markdown pages, frontmatter union, 70% floor, D<=1 staleness, FTS5 reindex | Fetch anything |
 | Delivery | `snowball/digest.py`, `snowball/alerts.py` | Discord digest and urgent alerts, `reported_at` bookkeeping | Select what is "interesting" by LLM |
 | Supervisor | `snowball/supervisor.py` | Process lifecycle, pools, waves, reaper, status | Business logic |
+
+Access policy (`access.yml`, module planned as `tools/access_policy.py` under task T2) decides which origins may leave the free fetch route. The modules above are the free-path architecture. Paid and browser routes stay inactive until provider activation (tasks T2–T4). T0 records that policy and does not add those modules.
 
 ### 2.3 Data flow, one page
 
@@ -177,14 +187,15 @@ These hold at every milestone. A change that breaks one is a design change, not 
   config.env             non-secret settings (Appendix A)
   .env                   secrets (QWEN_API_KEY, optional ZENROWS_API_KEY, RESIDENTIAL_PROXY_URL)
   topics.yml             seed families and seeds
+  access.yml             operator allowlist: exact origins, path prefixes, modes. Absent file means free fetch only.
   STOP                   touch to pause the supervisor between waves
 ```
 
 ### 2.5 Network
 
-- All LLM and Exa traffic leaves goku through one SSH tunnel to oracle, kept alive by `snowball-llm-tunnel.service` (`ssh -N -o ServerAliveInterval=30 -o ExitOnForwardFailure=yes -L 127.0.0.1:8812:127.0.0.1:8812 -L 127.0.0.1:8791:127.0.0.1:8791 oracle-a1`, `Restart=always`). Nothing on oracle changes, and the proxy keeps listening on localhost only.
-- `100.64.0.0/10` (the Tailscale CGNAT range) is in the SSRF deny list, so a crawled link can never reach a tailnet peer.
-- Outbound crawl traffic uses goku's own IP. There is no proxy unless the operator sets one (section 4.4).
+- All LLM and Exa traffic leaves goku through one SSH tunnel to oracle, kept alive by `snowball-llm-tunnel.service` (`ssh -N -o ServerAliveInterval=30 -o ExitOnForwardFailure=yes -L 127.0.0.1:8812:127.0.0.1:8812 -L 127.0.0.1:8791:127.0.0.1:8791 oracle-a1`, `Restart=always`). Nothing on oracle changes, and the proxy keeps listening on localhost only. Re-check that mapping at deployment. A historical listener address is not proof the tunnel is up.
+- `100.64.0.0/10` (the Tailscale CGNAT range) is in the SSRF deny list, so a crawled link can never reach a tailnet peer. The same deny list covers the browser egress gateway when that worker is activated. Local DNS pinning does not cover a remote provider's own resolver.
+- Outbound crawl traffic uses goku's own IP. There is no proxy unless provider activation for an approved public origin is in effect (section 4.5).
 
 ---
 
@@ -545,10 +556,10 @@ A skip at any inbound layer costs zero LLM tokens. A drop at verify costs one ex
 
 | Option | Problem on our hardware | Decision |
 |---|---|---|
-| Headless Chromium with stealth | 400–900 MB RSS per tab on aarch64; goku's supervisor is capped at 3 GB; one leaked browser froze oracle for 50 minutes on 2026-09-28 | Not used, not installed |
-| Datacenter IP plus retries | Oracle and Hetzner ASNs trigger Cloudflare Turnstile regardless of client fingerprint | Detect and mark `walled`, never retry with tricks |
-| Residential proxies | $3–8 per GB, $150–400 per month at our volume, for data that is published openly | Opt-in only, capped per day |
-| Captcha solving | Breaks I4 and most sites' terms | Never |
+| Headless Chromium with stealth as the default fetcher | 400–900 MB RSS per tab on aarch64; goku's supervisor is capped at 3 GB; one leaked browser froze oracle for 50 minutes on 2026-09-28 | Not the default fetcher and not installed for ordinary fetches. An optional one-context worker (768 MB, inside `MemoryMax=3G`) is only for an authorized supported challenge and stays off until provider activation. |
+| Datacenter IP plus retries | Oracle and Hetzner ASNs trigger Cloudflare Turnstile regardless of client fingerprint | Detect terminal walls. Do not rotate identity through a ban or a 429. |
+| Residential proxies | Historical rough cost band, not a current tariff. Spend is integer micro-USD and traffic is integer bytes. | Allowed only as a configured route for approved public origins, with a byte ceiling and a micro-USD reservation. Code for the route is not activation. |
+| Unbounded captcha solving or identity rotation | Breaks the access-denial rules in I4 | Never an evasion path. After provider activation, one named solver task may handle standalone Turnstile, a Turnstile challenge flow, or reCAPTCHA v2 on an approved public page. Other families are `unsupported_challenge`. A token is not access. |
 
 The target data (grant pages, hackathon listings, credit programs) is meant to be read. Where a site walls us, a different hub lists the same entity.
 
@@ -624,21 +635,23 @@ def classify_response(status: int, body: str, final_url: str) -> str:
 
 ### 4.4 Tier 1b: Exa contents
 
-When tier 1 returns `walled` or `outage` and the Exa reserve allows (`exa_budget.use_exa()` is true, meaning more than `RESERVE=3` live keys in the rotator), the collector calls the rotator's `/contents` endpoint for the URL. Exa fetches from its own infrastructure, so a Cloudflare wall against our ASN often does not apply. One call per URL per attempt; the result goes through the same safety gate and hash as a direct fetch. `fetches.route = 'exa_contents'`.
+When tier 1 returns a public challenge that policy may still read, and the Exa reserve allows (`exa_budget.use_exa()` is true, meaning more than `RESERVE=3` live keys in the rotator), the collector may call the rotator's `/contents` endpoint once for that URL. HTTP 429, a login wall, a paywall, a robots exclusion, or an explicit access denial does not call Exa, ZenRows, a residential proxy, or a solver. Exa results use the same safety gate and hash as a direct fetch. `fetches.route = 'exa_contents'`. Local DNS pinning does not cover Exa's resolver. Exa contents is not provider activation for ZenRows, residential proxy, or a solver.
 
 ### 4.5 Tier 2: pluggable paid offload (opt-in, budget-guarded)
 
-Disabled unless the operator sets `ZENROWS_API_KEY` or `RESIDENTIAL_PROXY_URL` in `.env`. When enabled, a page reaches tier 2 only if **all** of these hold:
+Tier 2 code, once it exists, is feature implementation. Provider activation requires all of: a credential, a current per-mode tariff, a nonzero shipped ceiling, and an `access.yml` entry for that exact origin and path prefix. A key alone does not activate the route. Shipped secret-free configuration keeps paid ceilings at zero. A missing prerequisite records the gate as `blocked` and does not count as a pass. Private topics never reach tier 2. A page reaches an activated tier 2 route only if **all** of these hold:
 
 ```python
 def paid_fetch_allowed(page, domain, budget) -> bool:
     return (
         CONFIG.paid_provider is not None
-        and budget.paid_fetches_today < CONFIG.MAX_PAID_FETCHES_PER_DAY  # default 100
+        and budget.paid_fetches_today < CONFIG.MAX_PAID_FETCHES_PER_DAY  # shipped 0; canary 100 after activation
         and yield_score(page) >= CONFIG.PAID_FETCH_MIN_YIELD_SCORE  # default 0.30
         and page.predicted_kind in ("hub", "item")  # never pay for articles
         and domain.paid_failures < 3  # provider also walled → stop paying
         and page.wall_kind != "robots"  # a robots disallow is final, no paying around it
+        and page.wall_kind not in ("login", "paywall", "access_denied", "ban")
+        and ceilings_activated  # shipped ceilings are zero; zero is not activation
     )
 
 
@@ -648,14 +661,19 @@ def yield_score(page) -> float:
     return (src.new_items_total + 1) / (src.fetch_count + 2)
 ```
 
+The policy chooses managed fetching or residential fetching before spending. It does not try every provider in sequence. Each acquisition has at most two billed retrieval operations, one solver task, and one browser context. A managed API call is one operation. A residential acquisition is one operation with a reserved byte ceiling. HTTP 429 never enters this tier.
+
 Providers:
 
 | Provider | How | Cost accounting |
 |---|---|---|
-| ZenRows | `GET https://api.zenrows.com/v1/?apikey=…&url=…&js_render=false` first; `js_render=true&premium_proxy=true` only on a second attempt for a hub with `yield_score >= 0.5` | 1 credit basic, 5 js_render, 10 premium, 25 both; written to `paid_fetches.cost_units` |
-| Residential proxy | curl_cffi `proxies={"https": RESIDENTIAL_PROXY_URL}` with the same impersonation | `paid_fetches.cost_units = ceil(bytes / 1 MB)` |
+| ZenRows | `GET https://api.zenrows.com/v1/` with the public target `url`, `original_status=true`; `js_render` and `premium_proxy` only for the mode the policy already chose | Reserve integer micro-USD before the call. Settle the confirmed actual micro-USD. Keep provider-specific units in their own column. Do not add those units to proxy bytes or solver charges. The old 1/5/10/25 credit table is not a current tariff. |
+| Residential proxy | One explicit curl_cffi proxy URL. The process refuses to run while proxy environment variables are set; `trust_env` is not used because the fetched client page does not document it | Integer bytes, ceiling `MAX_PROXY_BYTES_PER_ACQUISITION` (20971520). Micro-USD is reserved separately from bytes. |
+| CAPTCHA provider | One task per acquisition, and only for an authorized supported challenge after managed or residential fetch still shows that challenge | Integer micro-USD plus the provider task id. A ready token is not a successful fetch. |
 
-Every paid fetch writes a `paid_fetches` row before the request (so a crash still counts it) and updates `outcome` after. `snowball status` shows `paid_fetches_today / MAX` and credits consumed. When the day cap is hit, tier 2 is skipped silently and the page goes to tier 3.
+`mode=auto` sends `original_status=true` and no `js_render` or `premium_proxy`. Its provider-unit ceiling is 25 credits. Those credits are not converted to micro-USD. The response body is kept only when `Zr-Final-Url` is present and still inside the same allowlist entry. A missing `X-Request-Credits` header leaves the reserved micro-USD in place. A ZenRows `session_id` is not a proxy a browser or solver can dial. Every paid fetch writes a `paid_fetches` row before the request (so a crash still counts it) and updates `outcome` after. An unknown submission keeps its worst-case reservation. `snowball status` shows reservations and settlements in micro-USD, and provider-specific units separately. When the day cap is hit, or the ceiling is still the shipped zero, tier 2 is skipped and the page goes to tier 3 with an explicit budget reason. Do not log API keys, proxy credentials, or challenge tokens.
+
+The challenge path is fail-closed. `SNOWBALL_CHALLENGE_FIXTURE` defaults off, and `CAPTCHA_API_KEY` is read from the process environment, not from `config.env`. While the fixture is off, the orchestrator does not load access policy for a solve and does not call 2Captcha or Playwright. A missing browser returns `browser_unavailable` before any DNS lookup. One `solver_tasks` row per acquisition stores the provider task id and a redacted error; the client key, proxy password, cookies, and solver token are not stored. Polling waits at least five seconds, stops at the deadline, and does not create a second task after an ambiguous or unaccepted submission. A ready token is applied only in the same browser context. The fetch stays walled while the challenge is still visible. A token is not access. Camoufox in `tools/forum.py` is the inherited reader, not this solver, and it is not a second access policy. Owned Turnstile and reCAPTCHA fixtures are still required before that reader is removed. No live 2Captcha task, Playwright launch, or browser memory measurement is claimed here.
 
 ### 4.6 Tier 3: walled, mark and move on
 
@@ -667,7 +685,9 @@ UPDATE pages SET status='walled', wall_kind=:kind, strikes=0,
 UPDATE domains SET walled_count = walled_count + 1 WHERE domain=:domain;
 ```
 
-A walled page is re-checked after 30 days, then every 90 days, because walls come and go. A domain with `walled_count >= 10` and zero successful fetches is `status=blocked` and its pending pages are dropped from the frontier. No retries with different headers, no proxy rotation, no browser.
+A generic 401, 403, 407, or 451 without a recognized authorized public challenge is an access denial: stop escalation. A recognized supported challenge may itself arrive as HTTP 403; classify the body and the domain policy before deciding whether solving is permitted. HTTP 429 always cools the domain down and refunds the failure strike. It never starts paid identity rotation.
+
+A terminal wall is re-checked after 30 days, then every 90 days, because walls come and go. A domain with `walled_count >= 10` and zero successful fetches is `status=blocked` and its pending pages are dropped from the frontier. No header tricks and no proxy rotation through a ban. The default fetcher has no browser. The optional challenge worker runs only after provider activation, one context per acquisition, and never for login, paywall, robots, explicit denial, or a 429.
 
 ### 4.7 Outage versus failure (port of research-queue)
 
@@ -697,7 +717,7 @@ A rate limit never kills a good domain, and a structural 404 never pauses a whol
 
 ### 4.8 grok X route
 
-`grok -p` writes its full answer to stdout and then never exits. The collector launches it with `nohup … > /tmp/grok_<task>.log &`, captures `$!`, polls the log until the closing JSON bracket appears or 180 seconds pass, then `kill`s the PID. Every returned post is validated by Snowflake decoding (section 7.6). Posts outside the requested window, or whose ID fails to decode, are dropped before the safety gate.
+`grok -p` writes its full answer to stdout and then never exits. The collector launches an owned process, polls the log until the JSON array appears or the poll deadline passes, then stops that process tree. Snowflake decoding (section 7.6) is only a negative filter. The CLI answer is model text, not a documented X Search post body, so it is not ingested as a post. A citation URL is stored as a URL, not as the post text.
 
 ### 4.9 Fetch record
 
@@ -1329,6 +1349,8 @@ def resolve_and_pin(host: str, port: int) -> str:
 
 The pinned IP is handed to curl via `CURLOPT_RESOLVE` (section 4.3), so the connection goes to the address we checked and not to whatever a second DNS lookup returns (TOCTOU rebinding). Redirects are followed manually: for each `3xx`, build the absolute URL, run `canonical_url`, `resolve_and_pin` again, drop `Authorization` and `Cookie` if the origin changed, stop after 5 hops (`RecursionError`-style hard stop recorded as `failure`). API routes (Arctic Shift, Algolia, GitHub, rotator) have a fixed host allowlist and skip the resolver only because their hosts are constants.
 
+This pin applies to local direct fetches. A remote managed provider resolves the target itself. Do not treat local pinning as coverage for that hop. Paid remote targets are exact-origin and path allowlisted, carry no operator credentials, and stay disabled when the backend cannot show a private-destination and redirect restriction. The browser worker, when activated, has no direct egress. It connects only to an enforcing gateway that re-checks this deny list, allows target ports 80 and 443 only, and re-validates redirect hops. An upstream proxy that overrides destination enforcement is not eligible. URL checks inside the page are not a substitute for that gateway.
+
 Every block writes `fetches.outcome = 'ssrf_blocked'`. A domain with 3 blocks is `blocked`.
 
 ### 7.2 Injection quarantine
@@ -1453,7 +1475,7 @@ def snowflake_utc(post_id: str) -> datetime | None:
     return datetime.fromtimestamp(((v >> 22) + SNOWFLAKE_EPOCH_MS) / 1000, tz=timezone.utc)
 ```
 
-Every X item from grok must have a status URL with a decodable ID whose timestamp lies in `[window_start - 1 day, now + 5 min]`. A claimed `created_at` more than 48 hours from the decoded time is a hallucination; the item is dropped and the task's `noise_count` increments. x.com cannot be verified from these boxes (it serves its SPA shell with HTTP 200 for any path), so the Snowflake check is the only verification and failing it is final.
+A status id that does not decode, or whose timestamp is outside `[window_start - 1 day, now + 5 min]`, is dropped. A decodable in-window id is still not a post. X Search does not document a response field that carries the fetched post body, and text emitted by the grok CLI is model prose. `validate_x_posts` therefore returns no quotable items. Matching a citation URL records that URL only. x.com cannot be fetched as a page from these boxes: it serves its SPA shell with HTTP 200 for any path.
 
 ### 7.7 Dead-link check (port of research-queue)
 
@@ -1578,7 +1600,11 @@ ORDER BY rank DESC LIMIT 25;
 
 Urgent alerts: `deadline` within 7 days, `relevance >= 0.5`, `alerted_at IS NULL` → one Discord message immediately after the wave, then `alerted_at = now`. Fires once per entity.
 
-Digest is always written to `digests/YYYY-MM-DD.md`; Discord posting is skipped when `DIGEST_CHANNEL_ID` is empty. Sends go over REST with the bridge bot token, never the MCP.
+Digest is always written to `digests/YYYY-MM-DD.md`; Discord posting is skipped when `DIGEST_CHANNEL_ID` is empty. Sends go over REST with the bridge bot token, never the MCP. File-only mode does not set `reported_at` and does not count as Discord acknowledgement.
+
+Current defect, recorded as regression `digest-premature-acknowledgement` for task T9: `tools/digest.py` `compile_daily_digest` sets `entities.reported_at` and `entity_changes.reported_at` before `post_to_discord`. The 2026-10-08 plan baseline also records a digest unit command that passed an unsupported `--daily` argument. T0 does not change that runtime. A compile-time timestamp is not a message id.
+
+Current defect, recorded as regressions `digest-eval-zero-over-zero` and `digest-quote-length` for task T10: `tools/eval_gates.py` `eval_digest` sets its pass flag when the quote count is zero, and otherwise treats a quote longer than 10 characters as verified. The observed result is 0/0 with the pass flag set. That flag is not gate M4.08. T0 does not replace the evaluator.
 
 ### 8.7 `snowball ask`
 
@@ -1599,84 +1625,105 @@ Digest is always written to `digests/YYYY-MM-DD.md`; Discord posting is skipped 
 
 ## 9. Milestone roadmap M0 to M4
 
-Each milestone ships and runs on goku before the next starts. Every gate is a command with an expected result.
+This section lists 44 Fable acceptance gates: M0.01, M1.01–M1.12, M2.01–M2.12, M3.01–M3.11, and M4.01–M4.08. Access gates A01–A15 are additional and are not part of that 44. Each gate is a command with an expected result. The original schedule estimated about 44 hours. That estimate is not a test count and it is not a completion claim. A green unit suite and any existing git tag are not this list.
 
-### M0: repo, design, plan (done)
+### 9.1 Gate evidence
 
-Gate: this document and its predecessors are in `docs/`.
+Current status lives in `data/gate-evidence.jsonl`, one object per gate. The fields are `gate_id`, `status`, `command`, `exit_code`, `started_at`, `finished_at`, and redacted `evidence_path`. Status values are `implemented`, `fixture_verified`, `live_verified`, `soak_verified`, and `blocked`.
+
+`implemented` means the spec or the code contains the behavior. It is not verification. `blocked` means the gate has a known gap, a false pass, or a missing live prerequisite. `fixture_verified`, `live_verified`, and `soak_verified` are the only verified states. A verified row requires exit code 0, both timestamps, and a non-empty redacted evidence file. Fixture evidence does not satisfy a gate whose minimum status is `live_verified` or `soak_verified`. A soak gate stays open until the evidence window covers the required duration. `tools/eval_gates.py` `record_gate_evidence` enforces that rule.
+
+The baseline unit discovery for this worktree is 60 tests. That run is not the ledger. The status snapshot shipped with this amendment marks M0.01 `implemented` and every other gate `blocked`, with null exit code, timestamps, and evidence path, because the gate commands were not executed here.
+
+Evaluator code and production code are different paths. T0 does not implement T5, T9, or T10.
+
+| Defect | Owner | Ledger |
+|---|---|---|
+| `classify_heuristic` in `tools/eval_gates.py` scores the labelled file. The fetch pipeline does not call it. | T5, T10 | `classifier-not-production` blocks M2.01 |
+| `eval_extract` checks quotes already stored on fixture rows. It does not run production extraction or `quote_ok`. | T5, T10 | `extractor-not-production` blocks M2.02 |
+| `eval_digest` treats a quote longer than 10 characters as verified, and it sets the pass flag when the quote count is zero. The observed result is 0/0 with the pass flag set. | T10 | `digest-eval-zero-over-zero` and `digest-quote-length` block M4.08 |
+| `tools/digest.py` `compile_daily_digest` sets `reported_at` before `post_to_discord`. A digest file is not a Discord message id. | T9 | `digest-premature-acknowledgement` blocks M2.07, M2.08, M3.09, M4.01, and M4.08 |
+| `reindex_fts` can return counts for an empty database. That does not prove `wiki_fts` count equals the Markdown file count. | T8 | `empty-reindex` blocks M2.12 |
+| Six hand-picked strings are not the slug property gate of 10,000 seeded strings. | T5 | `slug-sample-not-property` blocks M1.10 |
+
+### M0: repo, design, plan
+
+| ID | Gate | Command | Pass |
+|---|---|---|---|
+| M0.01 | Spec documents | read this section, `docs/PLAN.md`, and `README.md` | The access amendment is present, and none of those files treats a unit suite or a git tag as completion of the 44 gates. Ledger status is `implemented` until a command records evidence. |
 
 ### M1: store, frontier, waterfall, page and query locks (about 10 h)
 
-Builds: section 5 DDL and connection helper; seeder grid; scheduler pop; tiers 0, 1, 1b, 3 (tier 2 as code path behind config, untested until a key exists); outage/failure split; SSRF guard; injection gate; page lock 2a/2b/2c; query lock; `fetches` logging; `snowball status`; retention; SSH tunnel unit; `pip install curl_cffi trafilatura` on goku (aarch64 wheels verified at install).
+Builds: section 5 DDL and connection helper; seeder grid; scheduler pop; tiers 0, 1, 1b, 3 (tier 2 stays inactive until provider activation: credentials, a current tariff, `access.yml`, and nonzero ceilings; a missing key is `blocked`); outage/failure split; SSRF guard; injection gate; page lock 2a/2b/2c; query lock; `fetches` logging; `snowball status`; retention; SSH tunnel unit; `pip install curl_cffi trafilatura` on goku (aarch64 wheels checked again at deployment).
 
-| Gate | Command | Pass |
-|---|---|---|
-| Seed determinism | `snowball seed --dry-run \| sha1sum` twice | identical hashes, `SELECT COUNT(*) - COUNT(DISTINCT query_key) FROM queries` = 0 |
-| 24 h soak | `systemctl --user status snowball-supervisor` after 24 h | active, zero restarts from crash in `journalctl` |
-| Zero duplicate fetches | `SELECT COUNT(*) FROM fetches WHERE due = 0` | 0 |
-| Same article, 3 URLs | feed `?utm_source=x`, `www.`, trailing slash variants | 1 `pages` row, `raw_urls` length 3, 1 `fetches` row |
-| Route logging | `SELECT route, COUNT(*) FROM fetches GROUP BY 1` | every row has a route; reddit rows are `arctic` only |
-| Wall handling | fetch a known Turnstile page | `status='walled'`, `wall_kind='challenge'`, exactly 1 `fetches` row after 24 h |
-| Rate limit refund | mock 429 then 200 | `strikes` unchanged, `paused_until` set, page fetched after pause |
-| 3 strikes | mock 404 ×3 | `status='dead'` |
-| SSRF | queue `http://169.254.169.254/`, `http://100.65.187.17/`, a hostname resolving to 127.0.0.1 | 3 `fetches.outcome='ssrf_blocked'`, no socket opened (strace or mock) |
-| Slug fixed point | property test, 10,000 random strings | `slug(slug(s)) == slug(s)` |
-| Disk flat | `du -sh raw logs` on day 1 and day 8 | day-8 size within 20% of day-7 size |
-| Budget sleep | set `LLM_TOKENS_PER_DAY=1` | supervisor logs `budget: llm` and keeps fetching; resumes next day |
+| ID | Gate | Command | Pass |
+|---|---|---|---|
+| M1.01 | Seed determinism | `snowball seed --dry-run \| sha1sum` twice | identical hashes, `SELECT COUNT(*) - COUNT(DISTINCT query_key) FROM queries` = 0 |
+| M1.02 | 24 h soak | `systemctl --user status snowball-supervisor` after 24 h | active, zero restarts from crash in `journalctl`. Minimum ledger status `soak_verified`. |
+| M1.03 | Zero duplicate fetches | `SELECT COUNT(*) FROM fetches WHERE due = 0` | 0. Minimum ledger status `live_verified`. |
+| M1.04 | Same article, 3 URLs | feed `?utm_source=x`, `www.`, trailing slash variants | 1 `pages` row, `raw_urls` length 3, 1 logical acquisition |
+| M1.05 | Route logging | `SELECT route, COUNT(*) FROM fetches GROUP BY 1` | every row has a route; reddit rows are `arctic` only. Minimum ledger status `live_verified`. |
+| M1.06 | Wall handling | excluded domain, and one approved supported challenge | Excluded domain stops with no paid call. An approved challenge gets one bounded chain and is not re-acquired for 24 h. A generic 401/403/407/451 without a recognized authorized challenge is an access denial. HTTP 429 cools down and does not rotate identity. Minimum ledger status `live_verified`. |
+| M1.07 | Rate limit refund | mock 429 then 200 | `strikes` unchanged, `paused_until` set, page fetched after pause, no paid evasion |
+| M1.08 | 3 strikes | mock 404 ×3 | `status='dead'` |
+| M1.09 | SSRF | queue `http://169.254.169.254/`, `http://100.65.187.17/`, a hostname resolving to 127.0.0.1, including browser and redirect routes | `fetches.outcome='ssrf_blocked'` and no destination socket. Minimum ledger status `live_verified`. |
+| M1.10 | Slug fixed point | property test, 10,000 seeded random strings | `slug(slug(s)) == slug(s)`. Six hand-picked strings do not satisfy this row. |
+| M1.11 | Disk flat | `du -sh raw logs` on day 1 and day 8 | day-8 size within 20% of day-7 size. Minimum ledger status `soak_verified`. Historical free-disk figures do not satisfy this row. |
+| M1.12 | Budget sleep | set `LLM_TOKENS_PER_DAY=1` | supervisor logs `budget: llm` and keeps fetching; resumes next day. Minimum ledger status `live_verified`. |
 
 ### M2: classify, extract, entity lock, compiler, digest (about 10 h)
 
 Builds: heuristics + LLM classify; BM25 filter; extraction schema and substring guard; Tier 1 + Tier 2 verification; entity lock with field diff; hub row diff; names queue → one search each; Python compiler with frontmatter union, 70% floor, D ≤ 1; digest and `reported_at`; yield counters; retire npm compiler.
 
-| Gate | Command | Pass |
-|---|---|---|
-| Classifier accuracy | `snowball eval classify tests/pages_labelled_50.jsonl` | ≥ 85% (≥ 43 of 50) |
-| Schema and quotes | `snowball eval extract tests/items_20.jsonl` | 100% of emitted rows validate; 100% of `evidence_quote` pass Tier 2 |
-| Names from text only | inject a page with no proper nouns | `names` gains 0 rows; a planted known-from-training name absent from the text never appears |
-| Deadline move | re-fetch a fixture with a changed deadline | exactly 1 `entity_changes` row (`field='deadline'`), 0 new entities, digest shows one "deadline moved" line |
-| Hub diff | fixture hub with 20 rows, then 22 | 2 `hub_rows` added, 2 pages queued, `interval_sec` halved |
-| Hub unchanged | re-fetch same hub | 0 new rows, `interval_sec` doubled, no LLM call (token counters unchanged) |
-| First real digest | morning after enable | `digests/<date>.md` has ≥ 1 entity with link, reason, evidence; Discord message id stored |
-| No repeat in digest | run digest twice | second run posts nothing; `digest_items` UNIQUE never violated |
-| 70% floor | mock LLM returning a 200-char summary for a 1,000-char page | file contains old + addition, not the 200 chars |
-| D ≤ 1 | graph A→B→C→D fixture, change A | B stale, C and D not stale; recompiling B marks nothing |
-| Compile time cap | 500 dirty pages | compiler returns in ≤ 600 s and leaves the rest dirty |
-| Reindex | `rm data/snowball.db-wiki-tables; snowball reindex` | `wiki_fts` count equals file count |
+| ID | Gate | Command | Pass |
+|---|---|---|---|
+| M2.01 | Classifier accuracy | `snowball eval classify tests/pages_labelled_50.jsonl` | Production classifier ≥ 85% (≥ 43 of 50). `classify_heuristic` does not satisfy this row. Owners T5 and T10. |
+| M2.02 | Schema and quotes | `snowball eval extract tests/items_20.jsonl` | Production extraction: 100% of emitted rows validate and 100% of `evidence_quote` pass Tier 2. A scan of quotes already stored on the fixture does not satisfy this row. Owners T5 and T10. |
+| M2.03 | Names from text only | inject a page with no proper nouns | `names` gains 0 rows; a planted known-from-training name absent from the text never appears |
+| M2.04 | Deadline move | re-fetch a fixture with a changed deadline | exactly 1 `entity_changes` row (`field='deadline'`), 0 new entities, digest shows one "deadline moved" line |
+| M2.05 | Hub diff | fixture hub with 20 rows, then 22 | 2 `hub_rows` added, 2 pages queued, `interval_sec` halved |
+| M2.06 | Hub unchanged | re-fetch same hub | 0 new rows, `interval_sec` doubled, no LLM call (token counters unchanged) |
+| M2.07 | First real digest | morning after enable | `digests/<date>.md` has ≥ 1 entity with link, reason, and evidence, and the send response stored a Discord message id. Setting `reported_at` while compiling the file does not satisfy this row. Minimum ledger status `live_verified`. Owner T9. |
+| M2.08 | No repeat in digest | run digest twice | second run posts nothing; `digest_items` UNIQUE never violated. A compile-time acknowledgement does not satisfy this row. Owner T9. |
+| M2.09 | 70% floor | mock LLM returning a 200-char summary for a 1,000-char page | file contains old + addition, not the 200 chars |
+| M2.10 | D ≤ 1 | graph A→B→C→D fixture, change A | B stale, C and D not stale; recompiling B marks nothing |
+| M2.11 | Compile time cap | 500 dirty pages | compiler returns in ≤ 600 s and leaves the rest dirty |
+| M2.12 | Reindex | `snowball reindex` | `wiki_pages`, `wiki_links`, and `wiki_fts` rebuilt; `wiki_fts` count equals the Markdown file count. An empty-database reindex does not satisfy this row. Owner T8. |
 
 ### M3: claim and topic locks, library-first, ask, alerts, grok X, refill (about 12 h)
 
 Builds: claim lock with FTS5 candidates; topic lock (TF-IDF); drift guard; library-first search skip; `snowball ask`; urgent alerts; grok route with Snowflake validation and kill-after-output; Exa findSimilar and backlink refill; Tier 3 reject-only check.
 
-| Gate | Command | Pass |
-|---|---|---|
-| Claim dedupe | same fact phrased 5 ways from 5 domains | 1 `claims` row, `n_sources = 5`, 4 `claim_variants` |
-| Reprint not a source | syndicated copy fixture | `status='reprint'`, `n_sources` unchanged |
-| Topic not duplicated | "free GPU credits" vs "cloud GPU credit programs" | cosine ≥ 0.30 (measured 0.64), `topics` count unchanged, 1 deepen task or 1 focus variant |
-| Topic boundaries | labelled 30 pairs (10 same, 10 deepen, 10 new) | new-vs-not-new ≥ 95% agreement; same-vs-deepen ≥ 80% agreement |
-| Drift guard | queue an off-topic finance page | `status='dropped'`, never in frontier again |
-| Repeat rate | `snowball status` after 7 days | `< 5%` |
-| Library-first | run the same topic twice | second run's `exa_calls` ≤ 30% of the first |
-| Ask | `snowball ask "which grants close in December?"` | answer in < 30 s, every sentence cites a `[path]` |
-| Urgent alert | entity with deadline in 5 days | exactly 1 alert message, `alerted_at` set, no second alert |
-| grok | X query fixture with 1 fabricated ID | fabricated item dropped; grok PID gone after task |
-| Refill | empty frontier fixture with 2 hubs | findSimilar + backlinks queue ≥ 1 page, else sleep 1800 logged |
+| ID | Gate | Command | Pass |
+|---|---|---|---|
+| M3.01 | Claim dedupe | same fact phrased 5 ways from 5 domains | 1 `claims` row, `n_sources = 5`, 4 `claim_variants` |
+| M3.02 | Reprint not a source | syndicated copy fixture | `status='reprint'`, `n_sources` unchanged |
+| M3.03 | Topic not duplicated | "free GPU credits" vs "cloud GPU credit programs" | cosine ≥ 0.30 (measured 0.64), `topics` count unchanged, 1 deepen task or 1 focus variant |
+| M3.04 | Topic boundaries | labelled 30 pairs (10 same, 10 deepen, 10 new) | new-vs-not-new ≥ 95% agreement; same-vs-deepen ≥ 80% agreement |
+| M3.05 | Drift guard | queue an off-topic finance page | `status='dropped'`, never in frontier again |
+| M3.06 | Repeat rate | `snowball status` after 7 days | `< 5%`. Minimum ledger status `soak_verified`. |
+| M3.07 | Library-first | run the same topic twice | second run's `exa_calls` ≤ 30% of the first. Minimum ledger status `live_verified`. |
+| M3.08 | Ask | `snowball ask "which grants close in December?"` | answer in < 30 s, every sentence cites a retrieved `[path]`. Minimum ledger status `live_verified`. Owner T10. |
+| M3.09 | Urgent alert | entity with deadline in 5 days | exactly 1 alert message, `alerted_at` set, no second alert. A badge string does not satisfy this row. Owner T9. |
+| M3.10 | grok | X query fixture with 1 fabricated ID | fabricated item dropped; owned grok PID tree gone after task. Minimum ledger status `live_verified`. Owner T1. |
+| M3.11 | Refill | empty frontier fixture with 2 hubs | findSimilar + backlinks queue ≥ 1 page, else sleep 1800 logged |
 
 ### M4: quality ports and resilience (about 12 h)
 
-Builds: dead-link check; `occurrence_seq` reaper hardening; tier 2 ZenRows with budget guard (tested with a real key, 5 calls); residential proxy path; feedback reactions; weekly summary; `quick_check`; backups.
+Builds: dead-link check; `occurrence_seq` reaper hardening; tier 2 ZenRows and residential proxy under the section 4.5 activation rule; feedback reactions; weekly summary; `quick_check`; backups. A present API key is not activation and is not a pass.
 
-| Gate | Command | Pass |
-|---|---|---|
-| Dead link | digest with a 404 link | line shows hub fallback, `link_dead = 1` |
-| Kill -9 resume | `kill -9` mid-wave, restart | reaper re-queues ≤ 1 task per worker; `SELECT COUNT(*) FROM fetches WHERE due = 0` still 0; no duplicate `entities` |
-| Stale worker | hold a claimed task past 600 s, then commit | commit updates 0 rows; task was re-run once |
-| Paid cap | `MAX_PAID_FETCHES_PER_DAY=3` | 4th blocked page goes `walled` with `wall_kind='budget'`, `paid_fetches` has 3 rows with outcome |
-| Paid yield gate | page with `yield_score 0.1` | tier 2 skipped, logged `paid: yield below 0.30` |
-| Feedback | 👎 reaction on a digest line | `domains.feedback_score` decreases; frontier `value` for that domain lower next wave; no page dropped by feedback alone |
-| Backup | `ls data/backup` after 8 nights | exactly 7 files |
-| Every digest line verified | `snowball eval digest --since 7d` | 100% of lines have a Tier-2-passing quote and a live link or hub fallback |
+| ID | Gate | Command | Pass |
+|---|---|---|---|
+| M4.01 | Dead link | digest with a 404 link | line shows a verified hub fallback, `link_dead = 1`. Owner T9. |
+| M4.02 | Kill -9 resume | `kill -9` mid-wave, restart | reaper re-queues ≤ 1 task per owned worker; `SELECT COUNT(*) FROM fetches WHERE due = 0` still 0; no duplicate `entities`. Minimum ledger status `live_verified`. |
+| M4.03 | Stale worker | hold a claimed task past 600 s, then commit | commit updates 0 rows; task was re-run once |
+| M4.04 | Paid cap | `MAX_PAID_FETCHES_PER_DAY=3` on an activated route | 4th blocked page goes `walled` with `wall_kind='budget'`; reservations count. Shipped ceiling 0 and a missing key stay `blocked`. |
+| M4.05 | Paid yield gate | page with `yield_score 0.1` | tier 2 skipped, logged `paid: yield below 0.30` |
+| M4.06 | Feedback | 👎 reaction on a digest line | `domains.feedback_score` decreases; frontier `value` for that domain lower next wave; no page dropped by feedback alone |
+| M4.07 | Backup | `ls data/backup` after 8 nights | exactly 7 restorable files. Minimum ledger status `soak_verified`. |
+| M4.08 | Every digest line verified | `snowball eval digest --since 7d` | Nonempty delivered sample. Every line has a Tier-2 quote found in the recorded source and a live link or a verified hub fallback. Zero quotes are not a pass. Quote length is not the check. Minimum ledger status `live_verified`. Owners T9, T10, and T13. |
 
-Total about 44 hours of agent time. Each milestone is a PR; Greptile and CodeRabbit run before merge.
+The hour estimate above is about 44 hours of agent time across M1–M4. Each milestone is a reviewable change. Greptile and CodeRabbit run before merge when those integrations exist. A missing review integration is a blocked review, not an approval. The 44-hour estimate and the 44 gate IDs are different counts. Neither count is a number of passing tests.
 
 ---
 
@@ -1684,8 +1731,8 @@ Total about 44 hours of agent time. Each milestone is a PR; Greptile and CodeRab
 
 | # | Failure mode | Where it bit (audit evidence) | Snowball mitigation | Section |
 |---|---|---|---|---|
-| 1 | **Scraping blocks and bot bans** | Datacenter IP 403s on Reddit and X; challenge pages returned as HTTP 200; deprecated `.rss` endpoints (last30days) | Route Reddit to Arctic Shift, HN to Algolia, GitHub to API, X to grok; curl_cffi Chrome fingerprint at tier 1; body-signature wall detection; mark `walled` and move on; opt-in paid tier under a daily cap | 4.2–4.6 |
-| 2 | **Egress SSRF and metadata exposure** | Agents following discovered links to `127.0.0.1`, RFC 1918, `169.254.169.254`; redirects bypassing checks (hyperresearch PR #53, #127, #130) | DNS pre-resolution with every answer checked, pinned via `CURLOPT_RESOLVE`, manual redirects re-validated, 5-hop cap, ports 80/443 only, Tailscale range denied | 7.1 |
+| 1 | **Scraping blocks and bot bans** | Datacenter IP 403s on Reddit and X; challenge pages returned as HTTP 200; deprecated `.rss` endpoints (last30days) | Free routes stay Arctic Shift, Algolia, GitHub API, and grok for X. Tier 1 uses curl_cffi and marks terminal walls. After provider activation, an approved public origin may use one managed or residential retrieval and, for a supported challenge, one solver task. Login, paywall, robots, explicit denial, and HTTP 429 do not escalate. Code for those routes is not activation. | 4.2–4.6 |
+| 2 | **Egress SSRF and metadata exposure** | Agents following discovered links to `127.0.0.1`, RFC 1918, `169.254.169.254`; redirects bypassing checks (hyperresearch PR #53, #127, #130) | DNS pre-resolution with every answer checked, pinned via `CURLOPT_RESOLVE`, manual redirects re-validated, 5-hop cap, ports 80/443 only, Tailscale range `100.64.0.0/10` denied. The same deny list applies to the browser egress gateway. Remote provider fetches are allowlisted and are not described as locally pinned. | 7.1 |
 | 3 | **Citation and quote hallucination** | Small models paraphrase quotes; LLM cite-checkers agree with themselves (hyperresearch `citecheck.py`) | Substring guard on names and quotes, Tier 1 numbers, Tier 2 verbatim with 0.90 window fallback, Tier 3 reject-only; drop, never soften | 7.4–7.5 |
 | 4 | **SQLite concurrency deadlocks** | Multi-worker writes in WAL without write-lock sequencing (hyperresearch `sync.py`, LDR connection lifecycle lock) | One process, `BEGIN IMMEDIATE` everywhere, `busy_timeout=5000`, retry wrapper, UPSERT not `INSERT OR REPLACE` | 5, 6.3 |
 | 5 | **Heavy ML dependency crashes** | PyTorch + FAISS, `faiss-cpu 1.14` SIGILL on ARM (LDR) | Zero Torch/FAISS. FTS5, BM25, TF-IDF, MinHash in pure Python; embeddings only as an optional endpoint behind a benchmark gate | 3.5, 7.3 |
@@ -1695,14 +1742,14 @@ Total about 44 hours of agent time. Each milestone is a PR; Greptile and CodeRab
 | 9 | **Compaction loss on page merge** | LLM merges summarising away 30–60% of a page; dropped frontmatter arrays (nashsu `page-merge.ts`) | Code owns frontmatter, Facts, Changes, Sources; LLM owns only Summary; `BODY_SHRINK_THRESHOLD=0.70` plus number-survival check; deterministic set union | 8.3–8.4 |
 | 10 | **Staleness cascades** | One update marking a whole vault stale recursively (lucasastorian `propagate_staleness`) | `dirty` vs `stale`, propagation only from fact changes, exactly one hop, stale recompiles never propagate | 8.5 |
 | 11 | **Duplicate work across parallel workers** | Parallel subagents re-scraping one URL (LDR PR #6759/#6760); sibling writers duplicating sections (GPTR PR #2158) | Page lock before fetch is the single-flight cache; `max 4 per domain` per wave; sibling fencing in extraction prompts | 3.2, 6.6 |
-| 12 | **Hallucinated post dates from X** | grok inventing recent dates for old or nonexistent posts (last30days `grok_x.py`) | Snowflake decode `(id >> 22) + 1288834974657`, window check, 48 h mismatch rule, final because x.com cannot be verified from here | 7.6 |
+| 12 | **Hallucinated post dates from X** | grok inventing recent dates for old or nonexistent posts (last30days `grok_x.py`) | Snowflake decode is a negative filter only. Model text is not ingested. A decodable in-window id is not a retrieved post | 7.6 |
 | 13 | **Orphaned rows and slug collisions** | Note rows written before their parent, slugs that re-slug differently (hyperresearch PR #86, #126) | Foreign keys ON, parent-first writes in one transaction, `slug()` fixed-point property test, 80-char truncation | 3.3, 5 |
 | 14 | **Credential leak on redirect** | `Authorization` forwarded cross-origin on 302 (last30days PR #1069) | Manual redirects drop auth and cookies when origin changes | 7.1 |
 | 15 | **FTS5 query syntax injection** | User or page text breaking `MATCH` (hyperresearch PR #52) | Query sanitiser: balanced quotes, escaped operators, tokens only | 8.7 |
 | 16 | **Empty report saved as success** | Search outage producing an empty but "successful" run (research-queue `MIN_REPORT_CHARS`) | A fetch with < 200 chars of text is a `failure`; a wave with 0 fetches ok and ≥ 10 outages is `status='aborted'` and does not advance any `next_check_at` | 4.3, 6.2 |
 | 17 | **Prompt injection from crawled pages** | Pages instructing the agent to add topics or run commands | No tools; quarantine regexes; nonce-wrapped untrusted blocks; quarantined pages emit nothing; output secret scan | 7.2 |
 | 18 | **Topic drift without approval** | Autonomous resolution PR abandoned for runaway drift (nashsu) | Family relevance floor, yield pruning, dry-hop cut, topics only from names and hubs | 3.5, 6.7 |
-| 19 | **Memory and disk exhaustion on the host** | Leaked browsers and local model tests froze oracle (2026-09-28); oracle disk at 91–97% | No browsers; `MemoryMax=3G` with a 2.2 GB soft guard; all state on goku; retention and 5 GB disk guard | 2.4, 6.4, 8.8 |
+| 19 | **Memory and disk exhaustion on the host** | Leaked browsers and local model tests froze oracle (2026-09-28); oracle disk at 91–97% | No default browser and no saved browser profile. The optional challenge worker is one context at 768 MB, inside `MemoryMax=3G`, and off until provider activation. Soft memory guard 2200 MB. State on goku. Free-disk floor 5 GB. Historical free-RAM and disk-percent figures are not deployment evidence. | 2.4, 6.4, 8.8 |
 | 20 | **Silent delivery failure** | Discord MCP "not allowlisted" dropping sends | REST with the bridge bot token; `reported_at` set only on HTTP 2xx with a message id | 8.6 |
 
 ---
@@ -1720,8 +1767,21 @@ Total about 44 hours of agent time. Each milestone is a PR; Greptile and CodeRab
 | `LLM_TOKENS_PER_DAY` | 2000000 | in + out |
 | `EXTRACT_TOKEN_BUDGET_IN` / `_OUT` | 12000 / 4000 | per extraction task |
 | `SUMMARY_MERGE_BUDGET_IN` / `_OUT` | 8000 / 2000 | per Summary merge |
-| `MAX_PAID_FETCHES_PER_DAY` | 100 | tier 2 cap |
+| `ACCESS_MODE` | off until activation | `auto` implements routes only after domain policy and nonzero ceilings exist |
+| `MAX_PAID_FETCHES_PER_DAY` | 0 shipped | tier 2 cap. 100 is the proposed canary after activation, not permission to spend |
+| `MAX_CAPTCHA_SOLVES_PER_DAY` | 0 shipped | submitted tasks, including unresolved ones. Canary 10 after activation |
+| `PAID_DAILY_BUDGET_MICRO_USD` | 0 shipped | combined daily ceiling in integer micro-USD. Canary 5000000 (USD 5) after activation |
+| `PAID_MONTHLY_BUDGET_MICRO_USD` | 0 shipped | combined calendar-month ceiling, IST. Canary 50000000 (USD 50) after activation |
 | `PAID_FETCH_MIN_YIELD_SCORE` | 0.30 | tier 2 gate |
+| `MAX_PAID_RETRIEVALS_PER_ACQUISITION` | 2 | billed retrieval operations, not a provider shopping loop |
+| `MAX_SOLVES_PER_ACQUISITION` | 1 | solver tasks per acquisition |
+| `MAX_PROXY_BYTES_PER_ACQUISITION` | 20971520 | integer bytes, including browser subresources |
+| `BROWSER_CONCURRENCY` | 1 | isolated challenge worker, off until activation |
+| `BROWSER_WORKER_MEMORY_MB` | 768 | inside `MemoryMax=3G` |
+| `ACCESS_DEADLINE_SEC` | 240 | whole escalation |
+| `CAPTCHA_DEADLINE_SEC` | 120 | inside the access deadline |
+| `CAPTCHA_POLL_SEC` | 5 | minimum provider poll interval |
+| `SESSION_TTL_SEC` | 600 | cookies and tokens die with the acquisition |
 | `DOMAIN_RATE_PER_MIN` | 6 | token bucket, burst 3 |
 | `MAX_BODY_BYTES` | 5242880 | 5 MB |
 | `RAW_RETENTION_DAYS` / `LOG_RETENTION_DAYS` | 14 / 30 | |
@@ -1729,7 +1789,7 @@ Total about 44 hours of agent time. Each milestone is a PR; Greptile and CodeRab
 | `DISK_MIN_FREE_GB` | 5 | |
 | `EMBEDDINGS_URL` | empty | optional; must pass the M3 topic benchmark before use |
 
-`.env` (secrets, never committed): `QWEN_API_KEY` (required), `GH_TOKEN` (optional), `ZENROWS_API_KEY` (optional, enables tier 2), `RESIDENTIAL_PROXY_URL` (optional, enables tier 2). The Discord bot token is read from the bridge's own env file path, never copied.
+`.env` (secrets, never committed): `QWEN_API_KEY` (required for model calls), `GH_TOKEN` (optional), `ZENROWS_API_KEY`, `RESIDENTIAL_PROXY_URL`, and `CAPTCHA_API_KEY` (optional; each is inert while ceilings are zero or `access.yml` lacks that origin). The Discord bot token is read from the bridge's own env file path, never copied. Never log API-key query parameters, proxy credentials, challenge tokens, or cookies.
 
 `topics.yml`: `families` with `recheck_days`, `weight`, `relevance_floor`, `focus`; `seeds` with `id`, `family`, `focus`, optional `regions`, `audiences`. The seeder expands `family x region x audience x source x window` into `queries` with `discovered_via='seed'`.
 
@@ -1743,9 +1803,10 @@ Total about 44 hours of agent time. Each milestone is a PR; Greptile and CodeRab
 | `snowball ask "<q>"` | library answer with citations |
 | `snowball digest [--date]` | build and (if configured) post the digest |
 | `snowball compile [--full]` | incremental compile, or full rebuild of `wiki/` from the DB |
-| `snowball reindex` | rebuild `wiki_*` tables from `wiki/*.md` |
+| `snowball reindex` | rebuild `wiki_*` tables from `wiki/*.md`. The current `tools/eval_gates.py` `reindex_fts` path is not M2.12. Owner T8. |
 | `snowball retention` | prune raw/logs, backup, expire deadlines, quick_check |
-| `snowball eval classify|extract|digest …` | milestone gate evaluators |
+| `snowball eval classify\|extract\|digest …` | evaluator commands. Current classify, extract, and digest implementations are not production-gate proofs. See section 9.1. Owners T5 and T10. |
+| `python tools/eval_gates.py evidence-check` | validate `data/gate-evidence.jsonl`. A successful check reports row counts. It does not run gates and it does not mark them verified. |
 
 ## Appendix C: constants table
 

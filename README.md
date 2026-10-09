@@ -277,7 +277,7 @@ sudo systemctl start snowball-loop.service
 
 The base worker unit uses `Restart=always`; a `STOP` file stops a wave but systemd will restart the process while the file remains. Use `systemctl stop` to pause the managed service without restart churn.
 
-Daily research caps are 800,000 estimated tokens overall, 600,000 extraction and 200,000 verification. The OMP transport estimates usage from text; these are not a billing ledger or provider quota guarantee. Each wave selects one topic, up to four pages and two queries. Paid scraping and solver ceilings remain zero; no Discord delivery channel is enabled by this deployment.
+Daily research caps are 800,000 estimated tokens overall, 600,000 extraction and 200,000 verification. The OMP transport estimates usage from text; these are not a billing ledger or provider quota guarantee. Each wave selects one topic and up to four pages. The two-query setting limits newly generated query seeds; pending query replay can add more searches in that wave. Paid scraping and solver ceilings remain zero; no Discord delivery channel is enabled by this deployment.
 
 ### Verification
 

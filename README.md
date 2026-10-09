@@ -279,6 +279,8 @@ The base worker unit uses `Restart=always`; a `STOP` file stops a wave but syste
 
 Daily research caps are 800,000 estimated tokens overall, 600,000 extraction and 200,000 verification. The OMP transport estimates usage from text; these are not a billing ledger or provider quota guarantee. Each wave selects one topic and up to four pages. The two-query setting limits newly generated query seeds; pending query replay can add more searches in that wave. Paid scraping and solver ceilings remain zero; no Discord delivery channel is enabled by this deployment.
 
+Automatic topic selection waits until `last_run_at + recheck_days × 86400` has elapsed; higher-ed seeds use a one-day recheck window. SQLite's `strftime('%s', 'now')` returns text, so the due-time comparison casts it to an integer. A never-run topic is immediately eligible, a topic exactly at its deadline is eligible, and an explicit `--topic` can override the automatic cooldown. Cooldowns do not impose a total-node or crawl-depth cap.
+
 ### Verification
 
 ```bash

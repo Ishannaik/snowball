@@ -3526,7 +3526,7 @@ class SnowballOrchestrator:
                f.weight * (1.0 + 0.1 * (SELECT count(*) FROM tasks k WHERE k.kind='deepen' AND k.status='pending'
                                          AND json_extract(k.payload,'$.topic_id')=t.id))                    AS value,
                CASE WHEN t.last_run_at IS NULL THEN 2.0
-                    WHEN t.last_run_at + f.recheck_days*86400 > strftime('%s','now') THEN 0.0
+                    WHEN t.last_run_at + f.recheck_days*86400 > CAST(strftime('%s','now') AS INTEGER) THEN 0.0
                     ELSE 1.0 + MIN(1.0, (strftime('%s','now') - t.last_run_at - f.recheck_days*86400) / 86400.0) END AS due
           FROM topics t JOIN families f ON f.name=t.family
          WHERE {where}"""

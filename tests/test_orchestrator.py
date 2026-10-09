@@ -397,6 +397,34 @@ class RuntimeBehaviorGates(unittest.TestCase):
         self.store.db.close()
         self.tmp.cleanup()
 
+    def test_topic_due_boundary_and_explicit_override(self):
+        clock = 1_800_000_000
+        interval = 14 * 86400
+        # SQLite's real strftime returns TEXT, including for Unix timestamps.
+        self.store.db.create_function("strftime", 2, lambda fmt, value: str(clock))
+        cases = {
+            "never-run": None,
+            "recent": clock - interval + 1,
+            "exactly-due": clock - interval,
+            "overdue": clock - interval - 86400,
+            "future": clock + 86400,
+        }
+        with self.store.tx() as db:
+            for key, last_run in cases.items():
+                db.execute(
+                    "INSERT INTO topics(key, family, title, focus, discovered_via, created_at, last_run_at) "
+                    "VALUES (?, 'opportunities', ?, ?, 'seed', ?, ?)",
+                    (key, key, key, clock - interval * 2, last_run),
+                )
+        worker = o.SnowballOrchestrator(self.cfg, self.store)
+        selected = {topic["key"]: topic["due"] for topic in worker.select_topics(10, None)}
+        self.assertEqual(set(selected), {"never-run", "exactly-due", "overdue"})
+        self.assertEqual(selected["exactly-due"], 1.0)
+        self.assertEqual(selected["overdue"], 2.0)
+        manual = worker.select_topics(1, "recent")
+        self.assertEqual([topic["key"] for topic in manual], ["recent"])
+        self.assertEqual(manual[0]["due"], 0.0)
+
     def test_hub_rows_diff_20_to_22_queues_two_and_halves_interval(self):
         """T5: 20->22 rows queues exactly two new pages and halves interval. Unchanged hub doubles interval and uses zero extraction tokens."""
         orch = o.SnowballOrchestrator(self.cfg, self.store, mode="local")

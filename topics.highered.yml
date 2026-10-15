@@ -1,5 +1,11 @@
-# Public research only: no transcripts, personal finances, or inferred grades.
-# Prior Hermes work is historical context, not evidence for current eligibility.
+# Historical seed file. This is not an approved goal contract and not a private profile.
+# Focus text below can mention a nationality, an intake year, visa cash, or a direct-PhD
+# alternative. That wording is recovered seed text. It does not set citizenship,
+# max_upfront_cash, consent_private_evaluation, grades, or transcripts.
+# An empty region list is not worldwide. This file does not confirm public scope.
+# New research seeds come from the approved PublicFrame.
+# Adopting this file does not fetch pages and does not approve the PhD alternative.
+# Prior Hermes work is historical context. It is not evidence of current eligibility.
 families:
   opportunities:
     recheck_days: 1

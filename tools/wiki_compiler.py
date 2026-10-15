@@ -29,12 +29,17 @@ import importlib.util
 
 
 def _sibling(name: str):
-    spec = importlib.util.spec_from_file_location(
-        f"snowball_{name}", Path(__file__).resolve().parent / f"{name}.py"
-    )
+    mod_name = f"snowball_{name}"
+    if mod_name in sys.modules:
+        return sys.modules[mod_name]
+    mod_path = Path(__file__).resolve().parent / f"{name}.py"
+    if not mod_path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location(mod_name, mod_path)
     if not spec or not spec.loader:
-        raise ImportError(f"Cannot load sibling {name}")
+        return None
     mod = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = mod
     spec.loader.exec_module(mod)
     return mod
 ROOT = Path(__file__).resolve().parent.parent
@@ -44,7 +49,38 @@ BODY_SHRINK_THRESHOLD = 0.70
 DIRTY_LIMIT = 200
 STALE_LIMIT = 50
 TIME_BUDGET_SEC = 600
-CODE_OWNED = frozenset({"facts", "changes", "sources", "overview", "entities", "topics", "discovered entities"})
+CODE_OWNED = frozenset({
+    "facts",
+    "changes",
+    "sources",
+    "overview",
+    "entities",
+    "topics",
+    "discovered entities",
+    "current source evidence",
+    "historical source evidence",
+    "provenance",
+})
+SOURCE_REGION_KEYS = frozenset({
+    "facts",
+    "changes",
+    "sources",
+    "overview",
+    "entities",
+    "topics",
+    "current_evidence",
+    "historical_evidence",
+    "provenance",
+})
+WIKI_REGIONS_DDL = """
+CREATE TABLE IF NOT EXISTS wiki_regions (
+  path TEXT NOT NULL,
+  region_key TEXT NOT NULL,
+  provenance TEXT NOT NULL CHECK (provenance IN ('source_evidence','human_note')),
+  body TEXT NOT NULL,
+  PRIMARY KEY (path, region_key)
+)
+"""
 NUMBERS_RX = re.compile(r"\b\d+(?:[\.,]\d+)*\b")
 _H2 = re.compile(r"(?m)^##[ \t]+(.+?)[ \t]*$")
 _MD_LINK = re.compile(r"\[[^\]]*\]\(([^)\s]+)\)")
@@ -190,19 +226,32 @@ def _extract_regions(body: str) -> dict[str, str]:
 
 
 def _replace_regions(old_body: str, regions: dict[str, str]) -> str:
+    """Replace code-owned regions in place. Bytes outside those regions stay put."""
     body = old_body
     for key, block in regions.items():
+        if key not in SOURCE_REGION_KEYS:
+            continue
+        repl = block if block.endswith("\n") else block + "\n"
         pattern = re.compile(
             rf"<!-- snowball:{re.escape(key)}:start -->.*?<!-- snowball:{re.escape(key)}:end -->\n?",
             re.S,
         )
         if pattern.search(body):
-            body = pattern.sub(lambda _m, repl=block: repl, body, count=1)
+            body = pattern.sub(lambda _m, replacement=repl: replacement, body, count=1)
         else:
-            if body and not body.endswith("\n"):
-                body += "\n"
-            body += "\n" + block
+            body += repl
     return body
+
+
+def _human_outside(body: str) -> str:
+    """Bytes that are not inside a code-owned source region, unchanged."""
+
+    def _keep(match: re.Match[str]) -> str:
+        if match.group(1).lower() in SOURCE_REGION_KEYS:
+            return ""
+        return match.group(0)
+
+    return _ANY_REGION.sub(_keep, body)
 
 
 def _human_portion(body: str) -> str:
@@ -291,6 +340,29 @@ def _guard_previous(old_body: str, new_body: str, candidate: str, *, unstructure
     return candidate
 
 
+def _private_summary_merge(old_text: str, update_text: str) -> str | None:
+    """Ask the attested private engine to merge a summary. Never calls a public model."""
+    transport = _sibling("engine_transport")
+    orch = _sibling("orchestrator")
+    if transport is None or orch is None:
+        return None
+    try:
+        cfg = orch.load_config()
+        engine = transport.LocalPrivateEngine(cfg, dry=False)
+        ok, _reason = engine.available()
+        if not ok:
+            return None
+        reply = engine.interpret(
+            "Merge the existing summary and the new information. Retain every number verbatim.\n\n"
+            f"Existing Summary:\n{old_text}\n\nNew Information:\n{update_text}\n",
+            max_out=1024,
+        )
+    except Exception:
+        return None
+    text = reply.text
+    return text if isinstance(text, str) and text.strip() else None
+
+
 def is_model_configured() -> bool:
     """Check if a local model is explicitly configured for summary merges."""
     if os.environ.get("NO_MODEL", "").lower() in ("1", "true", "yes"):
@@ -324,19 +396,7 @@ def merge_summary_local(
         except Exception:
             candidate = None
     elif is_model_configured():
-        try:
-            llm_mod = _sibling("llm")
-            prompt = (
-                "You are an exact research wiki compiler. Merge the existing summary and new information.\n"
-                "Retain all specific facts, dates, dollar amounts, and numerical figures verbatim.\n\n"
-                f"Existing Summary:\n{old_text}\n\n"
-                f"New Information:\n{update_text}\n\n"
-                "Updated Summary:"
-            )
-            model_name = os.environ.get("LOCAL_MODEL") or getattr(llm_mod, "ORNITH", "ornith-1.5-35b-a3b-abliterated")
-            candidate = llm_mod.chat(model_name, "You are a research wiki compiler.", prompt, max_tokens=1024)
-        except Exception:
-            candidate = None
+        candidate = _private_summary_merge(old_text, update_text)
     else:
         # Refuse to call a model when no model is configured
         candidate = None
@@ -380,21 +440,17 @@ def merge_page(old_content: str, new_frontmatter: dict[str, Any], new_body: str)
 
         if old_regions and new_regions:
             candidate = _replace_regions(old_body, new_regions)
-            if old_sum and new_sum and old_sum != new_sum:
-                merged_sum = merge_summary_local(old_sum, new_sum)
-                c_pre, c_secs = _split_sections(candidate)
-                parts = [c_pre]
-                for title, text in c_secs:
-                    if title.lower() == "summary":
-                        parts.append(f"## Summary\n\n{merged_sum}\n\n")
-                    else:
-                        parts.append(text)
-                candidate = "".join(parts)
-            body = _guard_previous(old_body, new_body, candidate, unstructured=False)
+            if _human_outside(candidate) != _human_outside(old_body):
+                raise RuntimeError(
+                    "wiki compile would change human text outside code-owned regions"
+                )
+            body = candidate
         elif old_secs and new_regions:
             human = _human_text_exact(old_body)
-            blocks = "".join(new_regions[key] for key in new_regions)
-            candidate = human.rstrip() + "\n\n" + blocks
+            blocks = "".join(
+                new_regions[key] for key in new_regions if key in SOURCE_REGION_KEYS
+            )
+            candidate = human + blocks if human.endswith("\n") else human + "\n" + blocks
             if old_sum and new_sum and old_sum != new_sum:
                 merged_sum = merge_summary_local(old_sum, new_sum)
                 c_pre, c_secs = _split_sections(candidate)
@@ -481,6 +537,34 @@ def ensure_wiki_schema(conn: sqlite3.Connection) -> None:
         "CREATE VIRTUAL TABLE IF NOT EXISTS wiki_fts USING fts5("
         "title, body, path UNINDEXED, tokenize='unicode61 remove_diacritics 2')"
     )
+    _ensure_region_audit(conn)
+
+
+def _schema_version(conn: sqlite3.Connection) -> int | None:
+    if not _has_table(conn, "schema_meta"):
+        return None
+    try:
+        row = conn.execute(
+            "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    if not row:
+        return None
+    try:
+        return int(row[0])
+    except (TypeError, ValueError):
+        return None
+
+
+def _ensure_region_audit(conn: sqlite3.Connection) -> bool:
+    """Create wiki_regions except on v2/v3, where migration owns that CREATE TABLE."""
+    if _has_table(conn, "wiki_regions"):
+        return True
+    if _schema_version(conn) in (2, 3):
+        return False
+    conn.execute(WIKI_REGIONS_DDL)
+    return True
 
 
 def _year_of(entity: dict[str, Any]) -> str:
@@ -561,6 +645,7 @@ def _load_entities(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         "aliases",
         "evidence_page_id",
         "wiki_path",
+        "provenance",
     ]
     have = _cols(conn, "entities")
     pick = [col for col in wanted if col in have]
@@ -596,31 +681,212 @@ def _load_changes(conn: sqlite3.Connection) -> dict[str, list[dict[str, Any]]]:
     return grouped
 
 
-def _load_claims(conn: sqlite3.Connection) -> dict[str, list[str]]:
+def _load_claims(conn: sqlite3.Connection) -> dict[str, list[dict[str, Any]]]:
     if not _has_table(conn, "claims"):
         return {}
     have = _cols(conn, "claims")
     if "text" not in have or "entity_key" not in have:
         return {}
+    select = ["entity_key", "text"]
+    if "hash" in have:
+        select.append("hash")
+    if "provenance" in have:
+        select.append("provenance")
     rows = _fetch(
         conn,
-        "SELECT entity_key, text FROM claims WHERE entity_key IS NOT NULL ORDER BY text",
+        f"SELECT {', '.join(select)} FROM claims WHERE entity_key IS NOT NULL ORDER BY text",
     )
-    grouped: dict[str, list[str]] = {}
+    grouped: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         if row.get("text"):
-            grouped.setdefault(str(row.get("entity_key")), []).append(str(row["text"]))
+            grouped.setdefault(str(row.get("entity_key")), []).append(dict(row))
     return grouped
+
+
+def _lead_label(provenance: Any) -> str:
+    token = str(provenance or "legacy_v3").strip().lower()
+    if token in {"legacy_v3", "lead_legacy", "lead", "imported_history", "unknown", ""}:
+        return "LEAD"
+    if token in {"observed", "fact"}:
+        return "FACT"
+    return token
+
+
+def _claim_records(claims: list[Any]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for item in claims:
+        if isinstance(item, str):
+            records.append({"text": item, "provenance": "legacy_v3"})
+        elif isinstance(item, dict) and item.get("text"):
+            records.append(item)
+    return records
 
 
 def _region(key: str, inner: str) -> str:
     return f"<!-- snowball:{key}:start -->\n{inner.rstrip()}\n<!-- snowball:{key}:end -->\n"
 
 
+PROVENANCE_REGION = _region(
+    "provenance",
+    "## Provenance\n\n"
+    "- Human text outside code-owned regions is HUMAN_NOTE and is not source evidence.\n"
+    "- Legacy rows are LEAD and are not reviewed.\n",
+)
+
+
+def _is_historical_observation(row: dict[str, Any]) -> bool:
+    if row.get("invalidated_at") not in (None, ""):
+        return True
+    return row.get("superseded_by") not in (None, "")
+
+
+def _load_observation_index(conn: sqlite3.Connection) -> dict[str, dict[Any, list[dict[str, Any]]]] | None:
+    if not _has_table(conn, "observations") or not _has_table(conn, "source_snapshots"):
+        return None
+    obs_cols = _cols(conn, "observations")
+    snap_cols = _cols(conn, "source_snapshots")
+    if not {"id", "snapshot_id", "quote"}.issubset(obs_cols) or "id" not in snap_cols:
+        return None
+    select = ["o.id AS obs_id", "o.snapshot_id AS snapshot_id", "o.quote AS quote"]
+    for column in (
+        "page_id",
+        "program_key",
+        "field_key",
+        "quote_start",
+        "quote_end",
+        "assurance",
+        "invalidated_at",
+        "invalidated_reason",
+    ):
+        if column in obs_cols:
+            select.append(f"o.{column} AS {column}")
+    for column in (
+        "content_hash",
+        "text_path",
+        "original_raw_path",
+        "visibility",
+        "provenance",
+        "source_cycle_label",
+        "superseded_by",
+        "retrieved_at",
+    ):
+        if column in snap_cols:
+            select.append(f"s.{column} AS snap_{column}")
+    rows = _fetch(
+        conn,
+        "SELECT "
+        + ", ".join(select)
+        + " FROM observations o JOIN source_snapshots s ON s.id = o.snapshot_id ORDER BY o.id",
+    )
+    by_page: dict[Any, list[dict[str, Any]]] = {}
+    by_program: dict[Any, list[dict[str, Any]]] = {}
+    for row in rows:
+        item = {
+            "id": row.get("obs_id"),
+            "snapshot_id": row.get("snapshot_id"),
+            "page_id": row.get("page_id"),
+            "program_key": row.get("program_key"),
+            "field_key": row.get("field_key") or "unknown",
+            "quote": row.get("quote") or "",
+            "quote_start": row.get("quote_start"),
+            "quote_end": row.get("quote_end"),
+            "assurance": row.get("assurance") or "unknown",
+            "invalidated_at": row.get("invalidated_at"),
+            "invalidated_reason": row.get("invalidated_reason"),
+            "content_hash": row.get("snap_content_hash"),
+            "text_path": row.get("snap_text_path"),
+            "original_raw_path": row.get("snap_original_raw_path"),
+            "snapshot_provenance": row.get("snap_provenance"),
+            "source_cycle_label": row.get("snap_source_cycle_label"),
+            "superseded_by": row.get("snap_superseded_by"),
+            "visibility": row.get("snap_visibility"),
+        }
+        if item["page_id"] is not None:
+            by_page.setdefault(item["page_id"], []).append(item)
+        if item["program_key"]:
+            by_program.setdefault(str(item["program_key"]), []).append(item)
+    return {"by_page": by_page, "by_program": by_program}
+
+
+def _observations_for_entity(
+    index: dict[str, dict[Any, list[dict[str, Any]]]] | None,
+    entity: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if not index:
+        return []
+    seen: set[Any] = set()
+    rows: list[dict[str, Any]] = []
+    page_id = entity.get("evidence_page_id")
+    page_keys: list[Any] = []
+    if page_id is not None:
+        page_keys.append(page_id)
+        try:
+            page_keys.append(int(page_id))
+        except (TypeError, ValueError):
+            pass
+    buckets = [index["by_page"].get(key, []) for key in page_keys]
+    if entity.get("key"):
+        buckets.append(index["by_program"].get(str(entity.get("key")), []))
+    for bucket in buckets:
+        for row in bucket:
+            if row["id"] in seen:
+                continue
+            seen.add(row["id"])
+            rows.append(row)
+    return rows
+
+
+def _pin_link(label: str, raw: Any) -> str | None:
+    if raw in (None, ""):
+        return None
+    target = str(raw).replace("\n", "").replace("\r", "")
+    return f"[{label}](<{target}>)"
+
+
+def _render_observation_block(row: dict[str, Any]) -> str:
+    assurance = str(row.get("assurance") or "unknown")
+    lines = [
+        f"- field `{row.get('field_key') or 'unknown'}` assurance `{assurance}` "
+        f"snapshot `{row.get('snapshot_id')}`"
+    ]
+    if row.get("content_hash"):
+        lines[0] += f" hash `{row['content_hash']}`"
+    if row.get("source_cycle_label"):
+        lines[0] += f" cycle `{row['source_cycle_label']}`"
+    if row.get("invalidated_reason"):
+        lines.append(f"  invalidated `{row['invalidated_reason']}`")
+    if row.get("superseded_by") not in (None, ""):
+        lines.append(f"  superseded_by `{row['superseded_by']}`")
+    if row.get("quote_start") is not None and row.get("quote_end") is not None:
+        lines.append(f"  span {row['quote_start']}:{row['quote_end']}")
+    for label, key in (("raw", "original_raw_path"), ("text", "text_path")):
+        pin = _pin_link(label, row.get(key))
+        if pin:
+            lines.append(f"  {pin}")
+    lines.append("> \"" + str(row.get("quote") or "") + "\"")
+    return "\n".join(lines)
+
+
+def _render_evidence_regions(rows: list[dict[str, Any]]) -> str:
+    current = [row for row in rows if not _is_historical_observation(row)]
+    historical = [row for row in rows if _is_historical_observation(row)]
+    parts = []
+    for key, title, group in (
+        ("current_evidence", "Current source evidence", current),
+        ("historical_evidence", "Historical source evidence", historical),
+    ):
+        body = "\n\n".join(_render_observation_block(row) for row in group) or "_None._"
+        parts.append(_region(key, f"## {title}\n\n{body}\n"))
+    return "\n".join(parts) + "\n"
+
+
 def _render_entity(
     entity: dict[str, Any],
     changes: list[dict[str, Any]],
-    claims: list[str],
+    claims: list[Any],
+    observations: list[dict[str, Any]] | None = None,
+    *,
+    evidence_enabled: bool = False,
 ) -> tuple[dict[str, Any], str]:
     year = _year_of(entity)
     amount = _amount_str(entity)
@@ -668,6 +934,9 @@ def _render_entity(
         fact_rows.append(("Location", entity["location"]))
     if entity.get("status"):
         fact_rows.append(("Status", entity["status"]))
+    lead = _lead_label(entity.get("provenance"))
+    if lead == "LEAD":
+        fact_rows.append(("Provenance", "LEAD"))
     fact_lines = ["| Field | Value |", "|---|---|"]
     fact_lines.extend(f"| {label} | {_cell(value)} |" for label, value in fact_rows)
     facts = "\n".join(fact_lines)
@@ -688,15 +957,26 @@ def _render_entity(
     else:
         changes_md = "_No recorded changes._"
 
+    prov_token = str(entity.get("provenance") or "legacy_v3")
     source_lines: list[str] = []
     if link:
-        source_lines.append(f"1. {link}")
+        if lead == "LEAD":
+            source_lines.append(f"- LEAD ({prov_token}): {link}")
+        else:
+            source_lines.append(f"1. {link}")
     if quote:
-        source_lines.append(f"> \"{quote}\"")
-    if claims:
-        source_lines.append("")
-        source_lines.append("Verified claims:")
-        source_lines.extend(f"- {text}" for text in claims)
+        if lead == "LEAD":
+            source_lines.append(f"- LEAD ({prov_token}): {quote}")
+        else:
+            source_lines.append(f"> \"{quote}\"")
+    for claim in _claim_records(claims):
+        label = _lead_label(claim.get("provenance"))
+        token = str(claim.get("provenance") or "legacy_v3")
+        text = str(claim["text"])
+        if label == "LEAD":
+            source_lines.append(f"- LEAD ({token}): {text}")
+        else:
+            source_lines.append(f"- {label}: {text}")
     if not source_lines:
         source_lines.append("_No sources recorded._")
     sources = "\n".join(source_lines)
@@ -709,6 +989,9 @@ def _render_entity(
         + "\n"
         + _region("sources", "## Sources\n\n" + sources + "\n")
     )
+    if evidence_enabled:
+        body += "\n" + _render_evidence_regions(observations or [])
+    body += "\n" + PROVENANCE_REGION
     return fm, body
 
 
@@ -812,7 +1095,27 @@ def _record_file(
     )
     if propagate:
         _propagate_stale(conn, rel, now)
+    _audit_page_regions(conn, rel, content)
     return len(links)
+
+
+def _audit_page_regions(conn: sqlite3.Connection, rel: str, content: str) -> None:
+    if not _has_table(conn, "wiki_regions"):
+        return
+    _fm, body = parse_frontmatter(content)
+    conn.execute("DELETE FROM wiki_regions WHERE path = ?", (rel,))
+    rows: list[tuple[str, str, str, str]] = []
+    for key, block in _extract_regions(body).items():
+        provenance = "source_evidence" if key in SOURCE_REGION_KEYS else "human_note"
+        rows.append((rel, key, provenance, block))
+    human = _human_outside(body)
+    if human:
+        rows.append((rel, "human_text", "human_note", human))
+    if rows:
+        conn.executemany(
+            "INSERT INTO wiki_regions (path, region_key, provenance, body) VALUES (?, ?, ?, ?)",
+            rows,
+        )
 
 
 def _touch_wiki_path(conn: sqlite3.Connection, key: str, rel: str) -> None:
@@ -831,7 +1134,14 @@ def _write_entity_page(
     *,
     propagate: bool,
 ) -> None:
-    fm, new_body = _render_entity(entity, changes, claims)
+    index = _load_observation_index(conn)
+    fm, new_body = _render_entity(
+        entity,
+        changes,
+        claims,
+        _observations_for_entity(index, entity),
+        evidence_enabled=index is not None,
+    )
     target = output_dir / rel
     old = target.read_text(encoding="utf-8") if target.is_file() else ""
     merged = merge_page(old, fm, new_body)
@@ -934,6 +1244,7 @@ def _render_topic(
     else:
         entity_lines.append("_No tracked entities currently linked to this topic._")
     lines.append(_region("entities", "\n".join(entity_lines) + "\n"))
+    lines.append(PROVENANCE_REGION)
     return fm, "\n".join(lines) + "\n"
 
 
@@ -1004,6 +1315,7 @@ def _render_hub(
     else:
         entity_lines.append("_No tracked entities currently linked to this hub domain._")
     lines.append(_region("entities", "\n".join(entity_lines) + "\n"))
+    lines.append(PROVENANCE_REGION)
     return fm, "\n".join(lines) + "\n"
 
 
@@ -1157,6 +1469,7 @@ def _render_family(
     else:
         entity_lines.append("_No entities currently tracked in this family._")
     lines.append(_region("entities", "\n".join(entity_lines) + "\n"))
+    lines.append(PROVENANCE_REGION)
     return fm, "\n".join(lines) + "\n"
 
 
@@ -1575,6 +1888,8 @@ def reindex_wiki(conn: sqlite3.Connection, wiki_dir: Path) -> dict[str, Any]:
         conn.execute("DELETE FROM wiki_links")
         conn.execute("DELETE FROM wiki_pages")
         conn.execute("DELETE FROM wiki_fts")
+        if _has_table(conn, "wiki_regions"):
+            conn.execute("DELETE FROM wiki_regions")
         page_count = 0
         link_count = 0
         for path in files:
@@ -1677,7 +1992,7 @@ def main() -> None:
     else:
         print(f"\n❄️  Wiki Compiled -> {args.out}")
         print(f"  • {stats['compiled_entities']} entity pages updated")
-        print(f"  • Index generated at: {args.out / 'INDEX.md'}\n")
+        print(f"  • Index generated at: {args.out / 'index.md'}\n")
 
 if __name__ == "__main__":
     main()

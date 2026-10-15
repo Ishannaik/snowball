@@ -17,10 +17,7 @@ from pathlib import Path
 import re
 import sqlite3
 import sys
-import time
 from typing import Any
-import urllib.error
-import urllib.request
 ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = ROOT / "data" / "snowball.db"
 WIKI_DIR = ROOT / "wiki"
@@ -133,15 +130,133 @@ def sanitize_fts_query(query: str) -> str:
     return " OR ".join(parts)
 
 
+class KnowledgeReadError(RuntimeError):
+    """A readonly knowledge read failed. This is not an empty search result."""
+
+    def __init__(self, message: str, *, code: str):
+        super().__init__(message)
+        self.code = code
+
+
+_REGION_RX = re.compile(
+    r"<!-- snowball:([a-zA-Z0-9_-]+):start -->.*?<!-- snowball:\1:end -->\n?",
+    re.S,
+)
+_SOURCE_REGION_KEYS = frozenset({
+    "facts",
+    "changes",
+    "sources",
+    "overview",
+    "entities",
+    "topics",
+    "current_evidence",
+    "historical_evidence",
+    "provenance",
+})
+_BLOCKED_ENDPOINT_MARKERS = (
+    "googleapis.com",
+    "openrouter.ai",
+    ":8088",
+    "agy-pool",
+    "api.openai.com",
+)
+_CLOUD_MODEL_MARKERS = (
+    "agy-pool/",
+    "openrouter",
+    "claude",
+    "gpt-",
+    "grok",
+    "gemini",
+)
+_PRIVATE_FIELD_KEYS = (
+    "max_upfront_cash",
+    "max_net_total_cost",
+    "min_living_adequacy_rule",
+)
+_PROVENANCE_LABEL = {
+    "human_note": "HUMAN_NOTE",
+    "lead": "LEAD",
+    "source_evidence": "source_evidence",
+}
+
+
+def _is_lead_line(line: str) -> bool:
+    stripped = line.strip()
+    return stripped.startswith("- LEAD") or stripped.startswith("LEAD ")
+
+
+def segment_page(body: str) -> list[tuple[str, str]]:
+    """Split a page into human notes, legacy leads, and source-evidence text."""
+    pieces: list[tuple[str, str]] = []
+    cursor = 0
+    for match in _REGION_RX.finditer(body):
+        if match.start() > cursor:
+            gap = body[cursor : match.start()]
+            if gap:
+                pieces.append(("human_note", gap))
+        key = match.group(1).lower()
+        block = match.group(0)
+        if key in _SOURCE_REGION_KEYS:
+            pieces.extend(_split_lead_block(block))
+        else:
+            pieces.append(("human_note", block))
+        cursor = match.end()
+    tail = body[cursor:]
+    if tail:
+        pieces.append(("human_note", tail))
+    if not pieces and body:
+        pieces.append(("human_note", body))
+    return pieces
+
+
+def _split_lead_block(block: str) -> list[tuple[str, str]]:
+    runs: list[tuple[str, list[str]]] = []
+    for line in block.splitlines(keepends=True):
+        kind = "lead" if _is_lead_line(line) else "source_evidence"
+        if runs and runs[-1][0] == kind:
+            runs[-1][1].append(line)
+        else:
+            runs.append((kind, [line]))
+    return [(kind, "".join(lines)) for kind, lines in runs if "".join(lines).strip()]
+
+
+def _chunks_from_body(path: str, title: str, body: str, chunk_chars: int = 800) -> list[dict[str, Any]]:
+    chunks: list[dict[str, Any]] = []
+    for provenance, segment in segment_page(body):
+        for offset in range(0, max(1, len(segment)), chunk_chars):
+            text = segment[offset : offset + chunk_chars].strip()
+            if not text:
+                continue
+            chunks.append({
+                "path": path,
+                "title": title,
+                "text": text,
+                "provenance": provenance,
+                "qualified": False,
+            })
+    return chunks
+
+
 def get_db(path: Path | None = None) -> sqlite3.Connection:
+    """Open one readonly connection. Never fall back to a writable handle."""
     p = path or DB_PATH
-    if not p.exists():
-        raise FileNotFoundError(f"Database not found at {p}. Run orchestrator or compile first.")
+    if not p.exists() or not p.is_file():
+        raise KnowledgeReadError(
+            f"Database not found at {p}. Run orchestrator or compile first.",
+            code="not_found",
+        )
+    uri = p.resolve().as_uri() + "?mode=ro"
     try:
-        conn = sqlite3.connect(f"file:{p.resolve().as_posix()}?mode=ro", uri=True)
-    except Exception:
-        conn = sqlite3.connect(str(p))
+        conn = sqlite3.connect(uri, uri=True)
+    except sqlite3.Error as exc:
+        raise KnowledgeReadError(f"readonly open failed: {exc}", code="readonly_open") from exc
     conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA query_only = ON")
+        conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+    except sqlite3.Error as exc:
+        conn.close()
+        raise KnowledgeReadError(f"readonly read failed: {exc}", code="readonly_read") from exc
     return conn
 
 
@@ -172,28 +287,24 @@ def search_local_knowledge(
                 cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='wiki_fts'").fetchone()
             )
             if has_wiki_fts:
-                try:
-                    cur.execute(
-                        """
-                        SELECT path, title, body, bm25(wiki_fts) AS rank
-                        FROM wiki_fts
-                        WHERE wiki_fts MATCH ?
-                        ORDER BY rank
-                        LIMIT ?
+                cur.execute(
+                    """
+                    SELECT path, title, body, bm25(wiki_fts) AS rank
+                    FROM wiki_fts
+                    WHERE wiki_fts MATCH ?
+                    ORDER BY rank
+                    LIMIT ?
                     """,
-                        (clean_fts, limit),
-                    )
-                    for r in cur.fetchall():
-                        candidate_pages.append(dict(r))
-                except sqlite3.OperationalError:
-                    candidate_pages = []
+                    (clean_fts, limit),
+                )
+                for r in cur.fetchall():
+                    candidate_pages.append(dict(r))
 
         # Query entities table if present (e2e compatibility)
-        try:
-            has_entities = bool(
-                cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='entities'").fetchone()
-            )
-            if has_entities:
+        has_entities = bool(
+            cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='entities'").fetchone()
+        )
+        if has_entities:
                 q_words = [w for w in re.findall(r"\w+", query) if len(w) > 2] or query.split() or ["grant"]
                 like_clauses = " OR ".join(["e.name LIKE ? OR e.eligibility LIKE ? OR e.kind LIKE ?"] * len(q_words))
                 params: list[Any] = []
@@ -212,26 +323,30 @@ def search_local_knowledge(
                 )
                 for r in cur.fetchall():
                     matched_entities.append(dict(r))
-        except Exception:
-            pass
 
         # Query claims table if present
-        try:
-            has_claims = bool(
-                cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='claims'").fetchone()
-            )
-            if has_claims:
+        has_claims = bool(
+            cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='claims'").fetchone()
+        )
+        if has_claims:
                 q_words = [w for w in re.findall(r"\w+", query) if len(w) > 2] or query.split()
                 if q_words:
+                    claim_cols = {
+                        str(row[1]) for row in cur.execute("PRAGMA table_info(claims)")
+                    }
+                    provenance_sql = (
+                        "c.provenance" if "provenance" in claim_cols else "'legacy_v3'"
+                    )
                     cur.execute(
-                        """
-                        SELECT c.hash, c.text, c.n_sources, p.canon_url AS url
+                        f"""
+                        SELECT c.hash, c.text, c.n_sources, p.canon_url AS url,
+                               {provenance_sql} AS provenance
                         FROM claims c
                         LEFT JOIN claim_sources cs ON c.hash = cs.claim_hash
                         LEFT JOIN pages p ON cs.page_id = p.id
                         WHERE c.text LIKE ?
                         LIMIT ?
-                    """,
+                        """,
                         (f"%{q_words[0]}%", limit),
                     )
                     for r in cur.fetchall():
@@ -239,9 +354,8 @@ def search_local_knowledge(
                             "text": r["text"],
                             "url": r["url"],
                             "sightings": r["n_sources"],
+                            "provenance": r["provenance"] or "legacy_v3",
                         })
-        except Exception:
-            pass
 
     # Disk-first fallback or augment from wiki directory
     if w_dir.is_dir() and not candidate_pages:
@@ -288,14 +402,7 @@ def search_local_knowledge(
             except Exception:
                 pass
 
-        for i in range(0, max(1, len(body)), chunk_chars):
-            c_text = body[i : i + chunk_chars].strip()
-            if c_text:
-                candidate_chunks.append({
-                    "path": rel_path,
-                    "title": title,
-                    "text": c_text,
-                })
+        candidate_chunks.extend(_chunks_from_body(rel_path, title, body, chunk_chars))
 
     filtered = filter_chunks(candidate_chunks, query, keep_ratio=0.5, top=25)
     retrieved_paths = sorted({c["path"] for c in filtered if c.get("path")})
@@ -307,95 +414,229 @@ def search_local_knowledge(
         "pages_count": len(candidate_pages),
         "entities": matched_entities,
         "claims": matched_claims,
+        "provenance": [
+            {
+                "path": c.get("path"),
+                "provenance": c.get("provenance") or "human_note",
+                "qualified": False,
+            }
+            for c in filtered
+        ],
     }
+
+def _flag(cfg: Any, attr: str, env: str) -> bool:
+    if cfg is not None and hasattr(cfg, attr):
+        value = getattr(cfg, attr)
+        if isinstance(value, bool):
+            return value
+        if value not in (None, ""):
+            return str(value).strip().lower() in {"1", "true", "yes"}
+    return os.environ.get(env, "").strip().lower() in {"1", "true", "yes"}
+
+
+def _text(cfg: Any, attr: str, env: str) -> str:
+    if cfg is not None:
+        value = getattr(cfg, attr, None)
+        if value not in (None, ""):
+            return str(value).strip()
+    return os.environ.get(env, "").strip()
+
+
+def _endpoint_blocked(url: str) -> bool:
+    lowered = url.lower()
+    return any(marker in lowered for marker in _BLOCKED_ENDPOINT_MARKERS)
+
+
+def _model_blocked(model_id: str) -> bool:
+    lowered = model_id.lower()
+    return any(marker in lowered for marker in _CLOUD_MODEL_MARKERS)
+
+
+def _is_public_only(evidence: dict[str, Any]) -> bool:
+    scope = str(evidence.get("scope") or "").strip().lower().replace("-", "_")
+    return scope == "public_only"
+
+
+def _private_scalars(evidence: dict[str, Any]) -> set[str]:
+    """Long private values that must not be copied into a public-only prompt."""
+    found: set[str] = set()
+
+    def walk(value: Any) -> None:
+        if isinstance(value, str):
+            text = value.strip()
+            if len(text) >= 8:
+                found.add(text)
+            return
+        if isinstance(value, dict):
+            for item in value.values():
+                walk(item)
+            return
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                walk(item)
+
+    for key in ("profile", "candidates", "private_fields"):
+        walk(evidence.get(key))
+    return found
+
+
+def _drop_private_readiness(answer: str, evidence: dict[str, Any]) -> str:
+    """Unknown private financial and eligibility fields are not met and are not readiness."""
+    if not _is_public_only(evidence):
+        return answer
+    kept: list[str] = []
+    for line in answer.splitlines():
+        lowered = line.casefold()
+        if "readiness" in lowered:
+            continue
+        if any(key in lowered for key in _PRIVATE_FIELD_KEYS):
+            continue
+        if "eligibility" in lowered and re.search(r"\bmet\b", lowered):
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
+def _failure(reason: str, *, detail: str | None = None) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "ok": False,
+        "status": "unavailable",
+        "reason": reason,
+        "requested_mode": "private_model",
+        "mode": "private_model",
+        "endpoint_role": "private_eval",
+        "available": False,
+        "usage_kind": "unknown",
+        "transport": None,
+        "downgraded": False,
+        "qualified": False,
+    }
+    if detail:
+        payload["detail"] = detail
+    return payload
+
+
+def _load_cfg() -> Any:
+    orch = _sibling("orchestrator")
+    if orch is None or not hasattr(orch, "load_config"):
+        return None
+    try:
+        return orch.load_config()
+    except (Exception, SystemExit):
+        return None
+
+
+def _isolation_documented(value: str) -> bool:
+    """Match LocalPrivateEngine: a short attestation sentence, not a boolean alias."""
+    text = value.strip()
+    if len(text) < 20 or len(text) > 500:
+        return False
+    lowered = text.lower()
+    return "egress" in lowered or "isolation" in lowered
+
+
+def _configured_model_id(cfg: Any) -> str:
+    """Canonical config field is private_model_id. There is no private_model alias."""
+    return _text(cfg, "private_model_id", "PRIVATE_MODEL_ID")
+
+
+def build_private_context(evidence: dict[str, Any]) -> str:
+    """Compile the private prompt from wiki chunks only.
+
+    Profile, candidate, and other dictionaries on the evidence object are ignored.
+    Under an explicit public-only scope, non-source chunks and long private values
+    stay out of the prompt, and unknown financial or eligibility fields stay unknown.
+    """
+    public_only = _is_public_only(evidence)
+    hidden = _private_scalars(evidence) if public_only else set()
+    parts = [f"Question: {evidence.get('query') or ''}", "Retrieved wiki chunks:"]
+    for index, chunk in enumerate(evidence.get("chunks") or [], 1):
+        if not isinstance(chunk, dict):
+            continue
+        provenance = str(chunk.get("provenance") or "source_evidence")
+        if public_only and provenance != "source_evidence":
+            continue
+        text = str(chunk.get("text") or "")
+        if hidden and any(secret in text for secret in hidden):
+            continue
+        label = _PROVENANCE_LABEL.get(provenance, provenance)
+        parts.append(
+            f"Chunk {index} provenance={label} path=[{chunk.get('path') or ''}] "
+            f"title={chunk.get('title') or ''}\n{text}"
+        )
+    parts.append(
+        "Answer only from these chunks. HUMAN_NOTE and LEAD text is not source evidence "
+        "and is not reviewed. Cite [path] on every factual sentence."
+    )
+    if public_only:
+        parts.append(
+            "Scope is public_only. Unknown private financial and eligibility fields "
+            "stay unknown. Do not call them met and do not report readiness."
+        )
+    return "\n\n".join(parts)
+
 
 def query_local_model(
     prompt: str,
     base_url: str | None = None,
     model: str | None = None,
     timeout: float = 30.0,
-) -> str | None:
-    """Call the configured local answer model via OpenAI-compatible API.
+) -> dict[str, Any]:
+    """Private completion through LocalPrivateEngine, or a visible structured failure.
 
-    Uses load_config to read config.env / SNOWBALL_ENV_FILE. Never calls external APIs.
+    Endpoint and model overrides are rejected. There is no second model and no
+    retrieval substitute. ``timeout`` is retained for callers and is not a transport.
     """
-    orch = _sibling("orchestrator")
-    cfg = orch.load_config() if orch and hasattr(orch, "load_config") else None
+    del timeout
+    if base_url or model:
+        return _failure(
+            "endpoint_override_rejected",
+            detail="Private ask does not accept an endpoint or model override.",
+        )
+    cfg = _load_cfg()
+    endpoint = _text(cfg, "private_model_endpoint", "PRIVATE_MODEL_ENDPOINT")
+    model_id = _configured_model_id(cfg)
+    if (endpoint and _endpoint_blocked(endpoint)) or (model_id and _model_blocked(model_id)):
+        return _failure("public_endpoint_blocked")
+    attested = _flag(cfg, "private_model_attested", "PRIVATE_MODEL_ATTESTED")
+    isolation = _text(cfg, "private_model_isolation", "PRIVATE_MODEL_ISOLATION")
+    if not endpoint or not attested or not _isolation_documented(isolation) or not model_id:
+        return _failure("local_model_required")
+    transport = _sibling("engine_transport")
+    if transport is None:
+        return _failure("private_engine_unavailable")
+    try:
+        engine = transport.LocalPrivateEngine(cfg, dry=False)
+        available, reason = engine.available()
+        if not available:
+            return _failure(str(reason or "local_model_required"))
+        reply = engine.interpret(prompt, max_out=1024)
+        text = reply.text
+        if not isinstance(text, str):
+            text = "" if text is None else str(text)
+        return {
+            "ok": True,
+            "status": "ok",
+            "text": text,
+            "model": reply.model,
+            "requested_model": reply.requested_model,
+            "reported_model": reply.reported_model,
+            "tokens_in": reply.tokens_in,
+            "tokens_out": reply.tokens_out,
+            "usage_kind": reply.usage_kind or "unknown",
+            "transport": reply.transport or "private_local",
+            "endpoint_role": "private_eval",
+            "requested_mode": "private_model",
+            "downgraded": False,
+            "available": True,
+            "qualified": False,
+        }
+    except transport.EngineUnavailable as exc:
+        return _failure(str(exc.reason or "local_model_required"))
+    except Exception as exc:
+        return _failure("private_engine_failed", detail=type(exc).__name__)
 
-    raw_base = (
-        base_url
-        or (cfg.local_base_url if cfg else None)
-        or os.environ.get("OPENAI_BASE_URL")
-        or "http://127.0.0.1:8800/v1"
-    )
-    url = raw_base.rstrip("/") + "/chat/completions"
-    model_name = (
-        model
-        or (cfg.local_model if cfg else None)
-        or os.environ.get("LOCAL_MODEL")
-        or "ornith-1.5-35b-a3b-abliterated"
-    )
-    fallback_model = (
-        (cfg.local_fallback_model if cfg else None)
-        or os.environ.get("LOCAL_FALLBACK_MODEL")
-        or "qwen3.8-27b-abliterated"
-    )
-    api_key = (
-        (cfg.local_api_key if cfg else None)
-        or os.environ.get("OPENAI_API_KEY")
-        or os.environ.get("QWEN_API_KEY")
-    )
 
-    payload = {
-        "model": model_name,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are Snowball's local library question answering assistant. You answer questions strictly and solely using the provided retrieved context chunks from the local wiki.\n"
-                    "Every single factual sentence in your answer MUST cite its source using [path] at the end of the sentence.\n"
-                    "If the provided chunks do not contain sufficient evidence to answer the question, state honestly: 'Insufficient verified evidence in the local knowledge base to answer the question.'\n"
-                    "Do NOT use outside knowledge, model memory, or speculation. Do NOT invent facts or URLs. Never make claims about future scheduling or background tasks."
-                ),
-            },
-            {
-                "role": "user",
-                "content": prompt,
-            },
-        ],
-        "temperature": 0.0,
-        "max_tokens": 1024,
-        "enable_thinking": False,
-        "chat_template_kwargs": {"thinking": False},
-    }
-
-    headers = {"Content-Type": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-
-    start_t = time.time()
-    for m in (model_name, fallback_model):
-        elapsed = time.time() - start_t
-        remaining = timeout - elapsed
-        if remaining <= 1.0:
-            break
-        call_timeout = min(15.0, remaining)
-        payload["model"] = m
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=call_timeout) as resp:
-                result = json.loads(resp.read().decode("utf-8"))
-                choices = result.get("choices")
-                if choices and len(choices) > 0:
-                    msg = choices[0].get("message", {})
-                    content = msg.get("content", "").strip()
-                    if content:
-                        return content
-        except Exception:
-            continue
-
-    return None
 def split_sentences_with_citations(text: str) -> list[str]:
     """Conservative sentence splitting preserving trailing citations per sentence."""
     sentences = []
@@ -452,7 +693,12 @@ def validate_and_filter_sentences(
     valid_sentences: list[str] = []
 
     for sentence in raw_sentences:
-        raw_citations = re.findall(r"\[([a-zA-Z0-9_\-./]+)\]", sentence)
+        # [text](<raw/...>) and [raw](<raw/...>) are snapshot links, not wiki-path citations.
+        pins = _PIN_RX.findall(sentence)
+        masked = sentence
+        for index, pin in enumerate(pins):
+            masked = masked.replace(pin, f"«PIN{index}»", 1)
+        raw_citations = re.findall(r"\[([a-zA-Z0-9_\-./]+)\]", masked)
         if not raw_citations:
             # Sentence without citation is dropped
             continue
@@ -470,8 +716,9 @@ def validate_and_filter_sentences(
             # No valid citation in retrieved paths
             continue
 
-        # Factual numeral grounding check
-        sent_norm = re.sub(r"(?<=\d),(?=\d)", "", sentence)
+        # Factual numeral grounding check. Digits inside a [path] citation or snapshot pin are not claims.
+        prose = re.sub(r"\[[a-zA-Z0-9_\-./]+\]", " ", masked)
+        sent_norm = re.sub(r"(?<=\d),(?=\d)", "", prose)
         sentence_nums = set()
         for raw_num in re.findall(r"\b\d+\b", sent_norm):
             if len(raw_num) >= 2:
@@ -494,11 +741,13 @@ def validate_and_filter_sentences(
             # Dropped because numerals were not grounded in source evidence
             continue
 
-        cleaned_sent = sentence
+        cleaned_sent = masked
         for c in raw_citations:
             norm_c = c.replace("\\", "/").lstrip("./")
             if norm_c not in valid_cits:
                 cleaned_sent = cleaned_sent.replace(f"[{c}]", "")
+        for index, pin in enumerate(pins):
+            cleaned_sent = cleaned_sent.replace(f"«PIN{index}»", pin)
         valid_sentences.append(cleaned_sent.strip())
 
     if not valid_sentences:
@@ -507,59 +756,124 @@ def validate_and_filter_sentences(
     return ("\n".join(valid_sentences), True)
 
 
+_PIN_RX = re.compile(r"\[(?:raw|text)\]\(<[^>\n]+>\)")
+
+
+def _retrieval_answer(query: str, chunks: list[dict[str, Any]]) -> str:
+    """One cited line per matching fact so the citation stays on that fact."""
+    lines: list[str] = []
+    q_words = [w.casefold() for w in re.findall(r"\w+", query) if len(w) > 2]
+    for chunk in chunks:
+        label = _PROVENANCE_LABEL.get(str(chunk.get("provenance") or "source_evidence"), "source_evidence")
+        path = chunk.get("path") or ""
+        text = str(chunk.get("text") or "")
+        content_lines: list[str] = []
+        pin_lines: list[str] = []
+        for raw_line in text.splitlines():
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith("<!--"):
+                continue
+            if _PIN_RX.search(stripped):
+                pin_lines.append(stripped)
+            if q_words and any(word in stripped.casefold() for word in q_words):
+                content_lines.append(stripped)
+        if not content_lines:
+            if len(lines) < 5:
+                snippet = " ".join(part for part in text.split() if not part.startswith("<!--"))[:160]
+                if snippet:
+                    lines.append(f"- {label}: {snippet} [{path}]")
+            continue
+        for stripped in content_lines:
+            lines.append(f"- {label}: {stripped} [{path}]")
+        for pin in pin_lines:
+            if pin in content_lines:
+                continue
+            lines.append(f"- {label}: {pin} [{path}]")
+    return "\n".join(lines)
+
+
+def _unqualified_footer(chunks: list[dict[str, Any]]) -> str:
+    kinds = {str(chunk.get("provenance") or "") for chunk in chunks}
+    if kinds & {"human_note", "lead"}:
+        return "HUMAN_NOTE and LEAD text is not source evidence and is not reviewed."
+    return ""
+
+
 def synthesize_answer(
     evidence: dict[str, Any],
     use_model: bool = True,
     base_url: str | None = None,
     model: str | None = None,
-) -> str:
-    """Synthesize citation-backed answer from retrieved local facts."""
-    query = evidence.get("query", "")
-    chunks = evidence.get("chunks", [])
-    retrieved_paths = set(evidence.get("retrieved_paths", []))
+) -> str | dict[str, Any]:
+    """Cite retrieved wiki text, or return a structured private-model failure.
+
+    ``use_model=False`` is the explicit retrieval path. A requested private model
+    that is unavailable does not fall back to that path.
+    """
+    query = str(evidence.get("query") or "")
+    chunks = list(evidence.get("chunks") or [])
+    retrieved_paths = set(evidence.get("retrieved_paths") or [])
 
     if not chunks or not retrieved_paths:
         # Entity and claim rows are not wiki paths. Emitting them without a
         # retrieved [path] would be an uncited answer.
         return f"Insufficient verified evidence in the local knowledge base to answer '{query}'."
 
-    raw_answer: str | None = None
     if use_model:
-        context_parts = []
-        for i, c in enumerate(chunks, 1):
-            context_parts.append(f"Chunk {i} (from [{c['path']}] - {c['title']}):\n{c['text']}")
-        context_text = "\n\n".join(context_parts)
-        prompt = (
-            f"Question: {query}\n\n"
-            f"Retrieved Wiki Context Chunks:\n{context_text}\n\n"
-            "Instructions:\n"
-            "- Answer the question using ONLY facts stated directly in the retrieved chunks above.\n"
-            "- Every single factual sentence must cite its source path at the end of the sentence as [path].\n"
-            "- If the chunks do not contain enough facts to answer, say: 'Insufficient verified evidence in the local knowledge base to answer the question.'\n"
-            "- Do not invent facts, URLs, or future schedules."
+        outcome = query_local_model(
+            build_private_context(evidence),
+            base_url=base_url,
+            model=model,
         )
-        raw_answer = query_local_model(prompt, base_url=base_url, model=model)
+        if not outcome.get("ok"):
+            return outcome
+        raw_answer = str(outcome.get("text") or "")
+        if not raw_answer.strip():
+            failed = dict(outcome)
+            failed.update({
+                "ok": False,
+                "status": "empty_reply",
+                "reason": "empty_reply",
+                "downgraded": False,
+                "qualified": False,
+                "text": "",
+                "answer": "",
+            })
+            return failed
+        answer, sufficient = validate_and_filter_sentences(
+            raw_answer, retrieved_paths, query, chunks=chunks
+        )
+        answer = _drop_private_readiness(answer, evidence)
+        if not sufficient or not answer.strip() or answer.startswith("Insufficient verified evidence"):
+            failed = dict(outcome)
+            failed.update({
+                "ok": False,
+                "status": "insufficient_evidence",
+                "reason": "insufficient_evidence",
+                "downgraded": False,
+                "qualified": False,
+                "text": answer,
+                "answer": answer,
+            })
+            return failed
+        success = dict(outcome)
+        success["answer"] = answer
+        success["text"] = answer
+        success["qualified"] = False
+        success["downgraded"] = False
+        return success
 
-    if not raw_answer:
-        lines: list[str] = []
-        q_words = [w.casefold() for w in re.findall(r"\w+", query) if len(w) > 2]
-        for c in chunks:
-            c_text = c["text"]
-            found = False
-            for sentence in re.split(r"(?<=[.!?\n])\s+", c_text):
-                s_strip = sentence.strip()
-                if not s_strip:
-                    continue
-                s_lower = s_strip.casefold()
-                if any(w in s_lower for w in q_words):
-                    lines.append(f"- {s_strip} [{c['path']}]")
-                    found = True
-            if not found and len(lines) < 5:
-                snippet = c_text[:160].replace("\n", " ").strip()
-                lines.append(f"- {snippet} [{c['path']}]")
-        raw_answer = "\n".join(lines)
-
-    answer, _ = validate_and_filter_sentences(raw_answer, retrieved_paths, query, chunks=chunks)
+    raw_answer = _retrieval_answer(query, chunks)
+    answer, _sufficient = validate_and_filter_sentences(
+        raw_answer, retrieved_paths, query, chunks=chunks
+    )
+    if not answer.startswith("Insufficient verified evidence"):
+        footer = _unqualified_footer(chunks)
+        if footer:
+            answer = answer + "\n" + footer
+    answer = _drop_private_readiness(answer, evidence)
+    if _is_public_only(evidence) and not answer.strip():
+        return f"Insufficient verified evidence in the local knowledge base to answer '{query}'."
     return answer
 
 
@@ -585,21 +899,25 @@ def main() -> None:
         "claims": [],
     }
 
-    # Open DB only if it already exists; never create a database
+    # Open an existing database readonly. A read failure is not an empty search.
     if db_path.exists():
         try:
             conn = get_db(db_path)
+        except KnowledgeReadError as exc:
+            _emit_read_error(args.query, exc, as_json=args.json)
+        try:
             try:
                 evidence = search_local_knowledge(conn, args.query, wiki_dir=wiki_path, limit=args.limit)
-            finally:
-                conn.close()
-        except Exception:
-            pass
-
-    # Fallback to direct local wiki search if no chunks from DB
-    if not evidence.get("chunks") and not evidence.get("entities"):
-        if wiki_path.is_dir():
-            evidence = search_local_knowledge(None, args.query, wiki_dir=wiki_path, limit=args.limit)
+            except sqlite3.Error as exc:
+                _emit_read_error(
+                    args.query,
+                    KnowledgeReadError(str(exc), code="readonly_read"),
+                    as_json=args.json,
+                )
+        finally:
+            conn.close()
+    elif wiki_path.is_dir():
+        evidence = search_local_knowledge(None, args.query, wiki_dir=wiki_path, limit=args.limit)
 
     has_matches = bool(evidence.get("chunks") or evidence.get("entities") or evidence.get("claims"))
 
@@ -620,7 +938,49 @@ def main() -> None:
         sys.exit(1)
 
     answer = synthesize_answer(evidence, use_model=not args.no_model)
+    if isinstance(answer, dict):
+        if not answer.get("ok"):
+            payload = {"query": args.query, **answer}
+            print(json.dumps(payload), file=sys.stderr)
+            if args.json:
+                print(json.dumps(payload, indent=2))
+            else:
+                print(f"Private model unavailable: {payload.get('reason')}", file=sys.stderr)
+            sys.exit(2)
+        text = str(answer.get("answer") or answer.get("text") or "")
+        if args.json:
+            payload = {
+                "query": args.query,
+                "answer": text,
+                "retrieved_paths": evidence.get("retrieved_paths", []),
+                "evidence_chunks": len(evidence.get("chunks", [])),
+                "provenance": evidence.get("provenance", []),
+                "mode": "private_model",
+                "sufficient_evidence": True,
+                "qualified": False,
+                "downgraded": False,
+                "status": "ok",
+                "model": answer.get("model"),
+                "requested_model": answer.get("requested_model"),
+                "reported_model": answer.get("reported_model"),
+                "usage_kind": answer.get("usage_kind"),
+                "transport": answer.get("transport"),
+                "tokens_in": answer.get("tokens_in"),
+                "tokens_out": answer.get("tokens_out"),
+            }
+            print(json.dumps(payload, indent=2))
+        else:
+            print("\n" + text + "\n")
+        sys.exit(0)
     sufficient = not answer.startswith("Insufficient verified evidence")
+    if (
+        not sufficient
+        and args.no_model
+        and (evidence.get("entities") or evidence.get("claims"))
+    ):
+        # Explicit retrieval can still report legacy rows. They stay LEAD, never proof.
+        answer = _lead_inventory(evidence)
+        sufficient = bool(answer.strip())
 
     if not sufficient:
         err_msg = f"Error: no matching pages or insufficient verified citations found for '{args.query}' in knowledge base."
@@ -644,7 +1004,10 @@ def main() -> None:
             "answer": answer,
             "retrieved_paths": evidence.get("retrieved_paths", []),
             "evidence_chunks": len(evidence.get("chunks", [])),
+            "provenance": evidence.get("provenance", []),
+            "mode": "retrieval" if args.no_model else "private_model",
             "sufficient_evidence": True,
+            "qualified": False,
             "status": "ok",
         }
         print(json.dumps(payload, indent=2))
@@ -652,6 +1015,48 @@ def main() -> None:
 
     print("\n" + answer + "\n")
     sys.exit(0)
+
+def _lead_inventory(evidence: dict[str, Any]) -> str:
+    """Deterministic --no-model report for rows that have no wiki path yet."""
+    lines: list[str] = []
+    for entity in evidence.get("entities") or []:
+        if not isinstance(entity, dict):
+            continue
+        bits = [
+            str(entity.get(key) or "").strip()
+            for key in ("name", "link", "evidence_quote")
+        ]
+        text = " ".join(bit for bit in bits if bit)
+        if text:
+            lines.append(f"- LEAD: {text}")
+    for claim in evidence.get("claims") or []:
+        if not isinstance(claim, dict):
+            continue
+        text = str(claim.get("text") or "").strip()
+        if text:
+            lines.append(f"- LEAD: {text}")
+    if not lines:
+        return ""
+    lines.append("HUMAN_NOTE and LEAD text is not source evidence and is not reviewed.")
+    return "\n".join(lines)
+
+
+def _emit_read_error(query: str, exc: KnowledgeReadError, *, as_json: bool) -> None:
+    payload = {
+        "query": query,
+        "ok": False,
+        "status": "read_error",
+        "code": exc.code,
+        "error": str(exc),
+        "downgraded": False,
+        "sufficient_evidence": False,
+        "qualified": False,
+    }
+    print(json.dumps(payload), file=sys.stderr)
+    if as_json:
+        print(json.dumps(payload, indent=2))
+    sys.exit(3)
+
 
 if __name__ == "__main__":
     main()

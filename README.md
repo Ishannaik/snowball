@@ -1,290 +1,119 @@
 # Snowball
 
-Snowball collects public sources for configured research topics, extracts entities and claims with verbatim evidence, and exposes the retained evidence in a read-only dashboard. SQLite stores the frontier and facts; a compiled Markdown wiki supports local answers and digests. Deduplication avoids redundant work within this database; it does not automatically import or reconcile older Hermes research.
+Snowball researches a user-approved goal. It proposes research tasks, searches and fetches public sources, checks exact quotations, obtains an independent evidence review, writes a cited deliverable, and asks a separate model to assess the locked rubric. A master's search is runtime input, not a built-in questionnaire or financial evaluator.
 
-```
-                           +------------------------+
-                           |       topics.yml       |
-                           +------------------------+
-                                       |
-                                       v
-+------------------+       +------------------------+       +--------------------+
-| Local Knowledge  | <---> |  snowball orchestrator | <---> | Web & API Fetchers |
-| (SQLite + Wiki)  |       |   (auto / local / LLM) |       | (Exa, Direct HTTP) |
-+------------------+       +------------------------+       +--------------------+
-         |                             |
-         v                             v
-+------------------+       +------------------------+
-|  snowball serve  |       |    snowball digest     |
-| (Evidence Web UI)|       | (Discord / Markdown)   |
-+------------------+       +------------------------+
-```
+**Build status:** integration verification is in progress. Passing component tests and source reviews do not establish end-to-end completion. The current implementation plan is [the generic integration plan](docs/superpowers/plans/2026-10-15-snowball-generic-harness-plan.md); its acceptance authority is [the approved generic specification](docs/superpowers/specs/2026-10-10-snowball-generic-goal-harness-design.md). The earlier specialist design and its checklist remain historical files, not the active backlog.
 
----
+## Workflow
 
-## Core Invariants
-
-- **Code owns queries and novelty**: The LLM has no tools and does not decide what to search. Queries are generated deterministically from seed definitions and pending entity names.
-- **Verbatim evidence required**: Every retained fact and entity change requires an exact quotation from an acquired page.
-- **Strict privacy boundaries**: Any topic flagged `private: true` runs exclusively against local models (`OPENAI_BASE_URL`) and never touches external APIs (Gemini, Grok, Exa, or paid fetchers).
-- **Public-origin compliance**: The engine reads public pages only. Login walls, paywalls, `robots.txt` exclusions, explicit access denials, and HTTP 429 rate limits stop crawl escalation immediately without evasion.
-- **SSRF and network isolation**: Loopback, link-local, cloud metadata, reserved, and `100.64.0.0/10` address ranges are blocked via pre-request IP resolution and direct socket pinning. Outbound traffic is restricted to ports 80 and 443.
-- **Quarantine against prompt injection**: Scraped pages are treated as untrusted text. Flagged injection attempts are written to `QUARANTINE.md` and prohibited from contributing new topics or instructions.
-
----
-
-## Multi-Model Architecture
-
-Snowball orchestrates multi-model workflows defined in `config.env`:
-
-| Mode | Extraction Engine | Verification Engine | Use Case |
-|---|---|---|---|
-| `auto` (default) | Gemini when available; otherwise configured OpenAI-compatible endpoint | Grok when available | Public research with local fallback. |
-| `gemini-bulk` | Gemini | Grok when available | Public extraction; missing Gemini access is an error rather than a fallback. |
-| `grok-xhigh` | Grok through `omp --no-tools` | Grok when available | Public research through the configured Grok provider. |
-| `local` | Configured OpenAI-compatible endpoint | Same adapter | Local deployment only if that endpoint actually runs a local model. |
- 
-`config.env` contains model-name defaults, not a verified provider catalog. Select IDs supported by your deployment. Gemini supports `GEMINI_TRANSPORT=api`, `omp`, or `ssh-omp`; API transport requires `GEMINI_API_KEY`. Private topics are routed to `OPENAI_BASE_URL`, so that endpoint **must be local and trusted** before adding any private data. A cloud proxy on loopback does not make the model private.
-
----
-
-## Installation & Setup
-
-### Prerequisites
-
-- Python `>= 3.10`
-- Optional: Node.js (for legacy wiki utilities) and Playwright (for optional browser acquisition)
-
-### Dependencies
-
-```bash
-# Clone and create an isolated Python environment
-git clone https://github.com/Ishannaik/snowball.git
-cd snowball
-python -m venv .venv
-# Linux/macOS:
-. .venv/bin/activate
-# Windows PowerShell: .venv\Scripts\Activate.ps1
-python -m pip install pyyaml curl_cffi
-
-# Optional: browser runtime for dynamic pages
-pip install "playwright>=1.49"
-playwright install chromium
+```mermaid
+flowchart LR
+    G[Goal and adaptive interview] --> A[Review goal, rubric and disclosure]
+    A --> C[Approve exact version]
+    C --> E[Separate finite grant and start]
+    E --> P[Planner and public tools]
+    P --> Q[Exact source quotes]
+    Q --> R[Independent evidence review]
+    R --> S[Cited synthesis]
+    S --> J[Independent rubric judge]
+    J -->|Gaps remain| P
+    J -->|Supported deliverable| D[Results]
+    P -->|Limit, stop, outage or stall| X[Partial result and reason]
 ```
 
-### Configuration
+The harness never applies to programs, purchases anything, sends outreach, fills forms, or exposes arbitrary shell tools. Installing it does not approve a goal or start personal research.
 
-Research configuration precedence is `config.env`, then `.env`, then `SNOWBALL_ENV_FILE`, then the process environment. Keep secrets outside Git. Delivery commands also need their credentials in the process environment (or a supported token file); do not assume every command loads the research `.env`.
+## Start the console
 
-```bash
-# Topic definitions:
-# - topics.example.yml: General startup grants, fellowships, and tech alpha
-# - topics.highered.yml: Funding-first on-campus 2027 CS/AI master's & direct PhDs
-cp topics.example.yml topics.yml
-# Optional: configure secrets in .env
-cat << 'EOF' > .env
-GEMINI_API_KEY=your_gemini_key
-DISCORD_WEBHOOK_URL=your_webhook_url
-DIGEST_CHANNEL_ID=your_channel_id
-EOF
+Python 3.10+ and the dependencies in `pyproject.toml` are required. Production public fetching uses `curl_cffi`; browser automation is not a fetch prerequisite.
+
+```sh
+python -m pip install -e .
+python snowball.py goal --db data/snowball.db serve --port 8989 --origin http://127.0.0.1:8989
 ```
 
-Paid fetch routes and CAPTCHA solvers default to disabled with zero ceilings (`MAX_PAID_FETCHES_PER_DAY=0`, `MAX_CAPTCHA_SOLVES_PER_DAY=0`). Shipping solver or proxy code does not activate spending; ceilings remain zero until credentials, current tariffs, and origin policy in `access.yml` are explicitly configured.
+Open `http://127.0.0.1:8989/`. The server binds loopback only. An interactive terminal displays the one-use bootstrap token once. For a service/non-interactive launch, the CLI writes it to `state/bootstrap-token` with private permissions instead of logging its contents. An operator may supply `SNOWBALL_CONSOLE_BOOTSTRAP_TOKEN` through a protected environment file.
 
----
+The authenticated console has five views: **Goal, Results, Activity, Evidence, Graph**. Graph is last. Goal contains the stored interview, recipient consent, editable proposal, reviewed-hash approval, grant, start and controls. Results and Evidence use persisted findings and exact excerpts; no demonstration rows populate an empty database.
 
-## CLI Reference
+Approval, grant, start and a bounded run are distinct actions. Pause prevents new admission and displays draining work. Revision retires the old execution and requires another reviewed approval, grant and start.
 
-The unified CLI entry point is `snowball.py`, accessible via `./snowball` (Linux/macOS), `snowball.bat` (Windows), or `python snowball.py`:
+## Model and search configuration
 
-### Research & Supervision
+The generic runtime sends explicit HTTP JSON requests. It does not inherit OMP/Claude CLI memory, extensions or conversation history and does not silently substitute models.
 
-```bash
-# Deterministically seed topics from topics.yml into the SQLite database
-python snowball.py seed [--topics topics.yml] [--dry-run] [--db data/snowball.db]
-# Or seed higher-ed funding-first topics:
-# python snowball.py seed --topics topics.highered.yml
+| Setting | Meaning |
+| --- | --- |
+| `SNOWBALL_MODEL_BASE_URL` | Operator-configured OpenAI-compatible base URL, ending in `/v1` |
+| `SNOWBALL_MODEL_API_KEY` | Optional gateway credential; omitted means no Authorization header |
+| `SNOWBALL_INTERVIEW_MODEL` | Adaptive question and proposal role |
+| `SNOWBALL_PLANNER_MODEL` | Bounded criterion-targeted task planning |
+| `SNOWBALL_RESEARCH_MODEL` | Source-backed claim proposals |
+| `SNOWBALL_REVIEW_MODEL` | Independent evidence review; different model from planner/research |
+| `SNOWBALL_SYNTHESIS_MODEL` | Proposed cited research deliverable |
+| `SNOWBALL_JUDGE_MODEL` | Independent semantic rubric assessment; different model from planner/research |
+| `SNOWBALL_MAX_OUTPUT_TOKENS` | Finite per-call output ceiling; default 4096 |
+| `SNOWBALL_SEARCH_URL` | Optional trusted search-service endpoint; approved source seeds work without search |
+| `SNOWBALL_SEARCH_API_KEY` | Optional credential for that search service only |
 
-# Run a single batch of research topics
-python snowball.py run [--topic <slug>] [--topics topics.yml] [--max-topics 2] [--mode auto] [--dry-run]
+`config.oracle.env` contains the non-secret direct AGY role configuration. The gateway at Oracle loopback `http://127.0.0.1:8088/v1` is a cloud proxy, not local inference. Its observed exact model identifiers are `gemini-3.8-flash-high` and `claude-sonnet-4-6`. Credentials never belong in a contract or source file.
 
-# Run one topic wave and report the supervisor outcome
-python snowball.py run-once [--topic <slug>] [--dry-run]
+A reported model mismatch, truncated output, malformed JSON or unavailable role stops that semantic operation. Calls record requested/reported identity and usage as actual or unknown. Unknown usage consumes its conservative reservation; it is not a zero-token call or a provider invoice guarantee.
 
-# Start the continuous supervisor loop (watches for STOP file to pause cleanly)
-python snowball.py supervise [--max-topics 1]
+Before the first interview model call, approve the exact recipient, input references and finite interview allowance. Public recipients receive only authorized public material. Rewriting private text does not make it public. Research grants do not silently grant interview disclosure permission.
 
-# Inspect frontier health, spend counters, and domain yield metrics
-python snowball.py status [--json]
+## CLI
+
+Use `snowball.py goal --db PATH COMMAND`; `--db` also works after the command. JSON values and options come from files so private context need not enter shell history.
+
+| Command | Purpose |
+| --- | --- |
+| `init --title TEXT [--goal-id ID]` | Create a code-rendered generic interview |
+| `list`, `status [--goal-id ID]` | Read stored goals/state without creating or migrating a database |
+| `answer --goal-id ID --question-id ID --value FILE --state STATE` | Store a typed confirmed, unknown, declined or unconfirmed answer |
+| `consent --goal-id ID --recipient ID --refs FILE --recipients FILE --calls N --tokens N` | Authorize exact interview inputs and a finite allowance; recipient map is explicit |
+| `interview --goal-id ID` | Ask adaptive follow-ups within that consent |
+| `propose --goal-id ID --options FILE` | Propose the rubric/public brief and attach reviewed limits, seeds and recipient permissions |
+| `approve --goal-id ID --payload FILE --body-hash HASH --row-version N` | Approve the exact reviewed immutable version; no execution |
+| `grant --goal-id ID [--limits FILE]` | Allocate allowance within the approved absolute ceilings |
+| `start --goal-id ID --grant-id N` | Make the separately granted goal runnable |
+| `run --goal-id ID --max-waves N` | Execute a bounded autonomous research run |
+| `pause`, `resume`, `stop`, `revise` with `--goal-id ID` | Explicit durable controls; revision never starts a replacement |
+| `supervise [--goal-id ID] --max-waves N --poll-sec N` | Process already-running goals only; idle otherwise |
+| `ask --goal-id ID QUERY` | Retrieve kept local evidence without a model call |
+| `export --goal-id ID --out FILE` | Write a cited Markdown research deliverable |
+| `diagnostics` | Read configuration/role availability without migration |
+| `migrate --root ROOT [--backup-dir DIR]` | Explicit preserving generic-schema migration |
+| `restore --bundle DIR --destination EMPTY_ROOT` | Restore the complete verified corpus into an isolated root |
+| `retention --root DIR --keep N` | Retain owned backup bundles; never prune source/wiki history |
+
+Inspect exact flags with `python snowball.py goal --db data/snowball.db COMMAND --help`. Mutations accept row-version CAS where applicable; a conflict requires review rather than blind retry. Errors are structured JSON with exit status 2.
+
+## Evidence and resource rules
+
+- Fetch only approved seeds or discovered public links. Public DNS/IP pinning, redirect revalidation, robots exclusions, terminal access walls and rate limits remain in force. Search and model credentials cannot follow redirects to another endpoint.
+- Keep original source bytes and exact extracted text with hashes. A model proposes quotations; code verifies the literal source span. A matching quote alone does not create a kept verdict.
+- Keep, dispute, reject or leave claims unknown through a separate reviewing model. Missing review remains unknown. Disputed/rejected/unknown material cannot support a positive verdict.
+- Assess the actual requested deliverable against the exact authorized rubric. Missing private assessment, unsupported citations, conflicts or unknown required criteria prevent full rubric-met.
+- Reserve expansion tasks, sources/bytes, model/tool calls and model usage before dispatch. Lifetime use survives grant replacement, restart, pause and revision. Record conservative lost usage for uncertain dispatched work.
+- Workers perform external I/O without sharing SQLite connections. The owning thread settles operations and commits against the dispatched binding. A stale callback cannot qualify the current version.
+- Working context has hard bounds and recipient filtering. Refresh selections at checkpoints and the configured researcher-turn cadence. Low-ranked evidence stays in the audit store even when it leaves working context.
+- A `STOP` file or interrupt stops process work without rewriting the user's substantive goal. Unknown, empty frontier, outage, exhaustion and stall are not success.
+
+## Migration and operator installation
+
+New goals use the generic schema. Existing legacy/specialist rows remain historical and never become approved generic goals through migration. Read-only commands refuse incompatible schemas instead of migrating them.
+
+Before migration, Snowball creates and verifies a bundle containing the SQLite database and referenced source/wiki bytes with SHA-256 checksums. Restore checks path confinement, symlinks/reparse points and checksums, stages a complete isolated corpus, and preserves logical wiki-relative identifiers. Keep the bundle outside a running corpus before operator cutover.
+
+The checked-in dashboard/supervisor units target generic commands and `data/snowball.db`. They are installation templates, not evidence of deployment. Oracle's existing research unit remains disabled; this build does not start it. The existing tailnet-only Caddy site can forward to the loopback console. Do not bind the application to a public interface.
+
+A personal research run still needs its actual approved goal, exact disclosure permissions and finite grant. Build verification uses synthetic goals and separately identified public model/tool scenarios, never an applicant profile.
+
+## Verification
+
+```sh
+python -m unittest discover -s tests -p 'test_generic_*.py' -v
 ```
 
-### Knowledge Base & Answering
-
-```bash
-# Answer questions from compiled Markdown wiki and SQLite facts with verified file citations
-python snowball.py ask "Which fellowship grants close this quarter?" [--wiki wiki] [--limit 12]
-
-# Synthesize answer deterministically without LLM calls
-python snowball.py ask "What programs support early stage founders?" --no-model
-
-# Incrementally compile authoritative Markdown wiki pages in wiki/ from database entities
-python snowball.py compile [--full] [--out wiki]
-
-# Rebuild SQLite FTS5 search indexes from base tables and Markdown wiki
-python snowball.py reindex [--wiki wiki]
-```
-
-### Evidence Dashboard (Frontend)
-
-Snowball includes an embedded read-only evidence console:
-
-```bash
-# Launch read-only HTTP dashboard (default: http://127.0.0.1:8989)
-python snowball.py serve [--host 127.0.0.1] [--port 8989] [--db data/snowball.db]
-
-# Print terminal ASCII summary of frontier health and domain yields
-python snowball.py visualize --terminal
-```
-
-### Delivery & Feedback
-
-```bash
-# Compile daily or weekly digest (writes to digests/YYYY-MM-DD.md)
-python snowball.py digest [--day YYYY-MM-DD] [--weekly]
-
-# Post digest to Discord (reported_at is updated only upon confirmed Discord delivery receipt)
-python snowball.py digest --post [--channel <id>]
-
-# Check and dispatch urgent opportunity/deadline notifications
-python snowball.py alerts [--post] [--channel <id>]
-
-# Record user feedback reaction on a delivered digest item
-python snowball.py feedback --item-id <id> --reaction up
-```
-
-### Maintenance, Retention & Backups
-
-```bash
-# Prune expired raw HTML and logs, enforce 5 GB free disk floor, and produce atomic backup
-python snowball.py retention [--keep 7] [--root .] [--db data/snowball.db]
-
-# Restore database from a consistent snapshot
-python snowball.py retention --restore data/backups/backup-2026-10-08.db --db data/snowball.db
-```
-
-### Diagnostics & Evaluation
-
-```bash
-# Run subsystem readiness diagnostics (topics, extraction, digest ack, retention, SSRF guard)
-python snowball.py diagnostics [--live] [--json]
-
-# Score production classifier and extraction against benchmark fixtures
-python snowball.py eval classify tests/pages_labelled_50.jsonl
-python snowball.py eval extract tests/items_20.jsonl
-python snowball.py eval topics tests/topic_pairs_30.jsonl
-python snowball.py eval digest --since 7d
-```
-
----
-
-## Data Behavior & Storage Isolation
-
-- **Default storage**: Runtime state is stored at `data/snowball.db` and `wiki/`; these paths are ignored by Git.
-- **Test isolation**: Offline test fixtures use temporary databases rather than populate the live dashboard. The synthetic Mozilla and hackathon records are not research findings.
-- **Empty dashboard on a fresh install**: Run `seed` to create topics, then an actual research wave to acquire evidence. `serve` reads the selected database and does not seed or fetch anything.
-- **Inspecting specific runs**: Pass an explicit database to inspect a retained test run, historical crawl, or backup:
-  ```bash
-  python snowball.py serve --db /path/to/test-run.db
-  ```
-
----
-
-## Repository Layout
-
-| Path | Purpose |
-|---|---|
-| `snowball.py` | Unified CLI entry point (`./snowball`, `snowball.bat`). |
-| `config.env` | System defaults, model routing, token budgets, and scraper ceilings. |
-| `topics.example.yml` | Topic definition schema, recheck intervals, and seed definitions. |
-| `topics.highered.yml` | Tracked research config: funding-first on-campus 2027 CS/AI master's & direct PhDs. |
-| `tools/orchestrator.py` | Multi-model wave runner, frontier queue, model adapter, and supervisor loop. |
-| `tools/visualize.py` | Read-only evidence web dashboard and terminal ASCII visualizer. |
-| `tools/ask.py` | Knowledge base answering CLI with verified file citation paths. |
-| `tools/wiki_compiler.py` | Incremental Markdown wiki compiler with length and entity protection. |
-| `tools/digest.py` | Digest preparation and Discord delivery with confirmed receipt acknowledgement. |
-| `tools/alerts.py` | Opportunity and deadline alert dispatcher. |
-| `tools/retention.py` | Raw HTML/log expiry, 5 GB disk floor enforcement, and SQLite backup/restore. |
-| `tools/eval_gates.py` | Subsystem diagnostics, gate evidence tracking, and evaluation benchmarks. |
-| `tools/quarantine.py` | Prompt injection detection, heuristic scanning, and quarantine manager. |
-| `tools/egress_guard.py` | SSRF protection, loopback/private IP blocking, and DNS socket pinning. |
-| `data/gate-evidence.jsonl` | Machine-readable ledger tracking gate verification statuses. |
-| `docs/SYSTEM_DESIGN.md` | Authoritative architecture specification and gate requirements. |
-| `systemd/` | Production systemd service and timer unit templates. |
-
----
-
-## Gate Ledger & Verification Status
-
-Snowball's formal specification ([docs/SYSTEM_DESIGN.md](docs/SYSTEM_DESIGN.md)) defines 44 Fable gates (M0–M4) plus 15 access policy gates (A01–A15). Progress is tracked in `data/gate-evidence.jsonl`:
-
-- **Strict Evidence Standard**: Passing unit tests or git tags does not constitute gate verification. A gate is verified only when an exact verification command, exit code, execution timestamps, and an artifact evidence path are recorded.
-- **Live evidence remains separate**: The deployment smoke checks do not establish multi-day soak, frontier repetition, residential egress, or benchmark gates. Inspect the runtime ledger rather than infer gate completion from the test suite; ignored runtime evidence is not shipped in a clone.
-- **Subsystem Diagnostics**: Run `python snowball.py diagnostics` to evaluate local readiness across database schemas, disk retention floors, SSRF pinning, and gate ledger state.
-
----
-
-## Oracle Deployment
-
-The Oracle checkout uses branch `feat/fable-completion-access` at `/home/ubuntu/repos/snowball`. The dashboard reads `data/highered.db`, separate from the older default database. Public higher-ed topics use `config.oracle.env`: Gemini extraction and Claude reject-only verification through OMP's existing `agy-pool` provider at `http://127.0.0.1:8088/v1`. OAuth credentials stay in the proxy's account store; none are included here. The verifier retains the legacy `grok` adapter/accounting label even when its configured model is Claude.
-
-The dashboard URL is **https://snowball.ishannaik.com/**. You must be on the permitted tailnet. Its DNS-only A record points to `100.68.165.73`; Caddy listens there on 443 and forwards to `127.0.0.1:8989`. The [site block](systemd/snowball.caddy) uses the existing Cloudflare DNS-01 certificate configuration and rewrites the upstream Host header. Do not bind the dashboard to a public/wildcard address to bypass its DNS-rebinding guard.
-
-### Reproduce the runtime setup
-
-Install dependencies using the setup commands above. Run these commands from the Oracle checkout as `ubuntu`; the OMP `agy-pool` provider and Exa rotator must already exist:
-
-```bash
-SNOWBALL_ENV_FILE="$PWD/config.oracle.env" .venv/bin/python snowball.py seed \
-  --topics topics.highered.yml --db data/highered.db
-
-SNOWBALL_ENV_FILE="$PWD/config.oracle.env" .venv/bin/python snowball.py run-once \
-  --topics topics.highered.yml --db data/highered.db \
-  --topic highered-gulf-ms-2027 --mode gemini-bulk --json
-
-sudo install -m 644 systemd/snowball-dashboard.service /etc/systemd/system/
-sudo install -m 644 systemd/snowball-loop.service /etc/systemd/system/
-sudo mkdir -p /etc/systemd/system/snowball-loop.service.d
-sudo install -m 644 systemd/snowball-loop.service.d/oracle.conf \
-  /etc/systemd/system/snowball-loop.service.d/oracle.conf
-sudo systemctl daemon-reload
-sudo systemctl enable --now snowball-dashboard.service snowball-loop.service
-```
-
-Add `systemd/snowball.caddy` to the existing Caddyfile, validate it with the existing certificate environment, then reload Caddy. Preserve the other sites and global settings. The Caddy Cloudflare token belongs in the existing protected server environment, not this repository.
-
-### Operate and inspect
-
-```bash
-sudo systemctl status snowball-loop.service snowball-dashboard.service
-sudo journalctl -u snowball-loop.service -n 50 --no-pager
-.venv/bin/python snowball.py status --db data/highered.db --json
-curl --fail https://snowball.ishannaik.com/api/status
-# Pause the managed worker; leave the read-only dashboard online.
-sudo systemctl stop snowball-loop.service
-# Resume:
-sudo systemctl start snowball-loop.service
-```
-
-The base worker unit uses `Restart=always`; a `STOP` file stops a wave but systemd will restart the process while the file remains. Use `systemctl stop` to pause the managed service without restart churn.
-
-Daily research caps are 800,000 estimated tokens overall, 600,000 extraction and 200,000 verification. The OMP transport estimates usage from text; these are not a billing ledger or provider quota guarantee. Each wave selects one topic and up to four pages. The two-query setting limits newly generated query seeds; pending query replay can add more searches in that wave. Paid scraping and solver ceilings remain zero; no Discord delivery channel is enabled by this deployment.
-
-Automatic topic selection waits until `last_run_at + recheck_days × 86400` has elapsed; higher-ed seeds use a one-day recheck window. SQLite's `strftime('%s', 'now')` returns text, so the due-time comparison casts it to an integer. A never-run topic is immediately eligible, a topic exactly at its deadline is eligible, and an explicit `--topic` can override the automatic cooldown. Cooldowns do not impose a total-node or crawl-depth cap.
-
-### Verification
-
-```bash
-python -m unittest discover -s tests -p "test_*.py"
-```
-
-Offline tests do not exercise live model credentials or populate the production database. A meaningful deployment check requires a completed acquisition/extraction wave, persisted evidence, and a browser check of the actual dashboard. `--topics` applies to seed, batch, one-wave, and supervisor commands; the regression suite covers selection from an explicit topic file.
+The generic tests cover durable controls, source/transport boundaries, privacy, model output failures, context bounds and integration scenarios. Actual browser, public-source/model and rollback scenarios must accompany the final integration evidence. Historical component review #11 is not a completion certificate for the integrated tool.

@@ -1,5 +1,5 @@
 [Unit]
-Description=Snowball read-only evidence dashboard
+Description=Snowball console
 After=network-online.target
 
 [Service]
@@ -7,7 +7,10 @@ Type=simple
 User=ubuntu
 Group=ubuntu
 WorkingDirectory=/home/ubuntu/repos/snowball
-ExecStart=/home/ubuntu/repos/snowball/.venv/bin/python /home/ubuntu/repos/snowball/snowball.py serve --host 127.0.0.1 --port 8989 --db /home/ubuntu/repos/snowball/data/highered.db
+# Generic console only. Model calls still require explicit interview consent or research grants.
+# Installing this unit does not approve a goal or start snowball-loop.service.
+EnvironmentFile=-/home/ubuntu/repos/snowball/config.oracle.env
+ExecStart=/home/ubuntu/repos/snowball/.venv/bin/python /home/ubuntu/repos/snowball/snowball.py goal --db /home/ubuntu/repos/snowball/data/snowball.db serve --origin https://snowball.ishannaik.com --port 8989
 Restart=on-failure
 RestartSec=5
 UMask=0077
@@ -15,8 +18,8 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
-# SQLite read-only connections still need the WAL shared-memory sidecar.
-ReadWritePaths=/home/ubuntu/repos/snowball/data
+# Console writes SQLite under data/. WAL still needs this directory writable.
+ReadWritePaths=/home/ubuntu/repos/snowball/data /home/ubuntu/repos/snowball/state
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictSUIDSGID=yes
 LockPersonality=yes

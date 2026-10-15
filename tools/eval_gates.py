@@ -10,6 +10,13 @@
 Gate completion is a verified row from `record_gate_evidence` in
 `data/gate-evidence.jsonl`. `evidence-check` validates that snapshot. It does
 not run gates and it does not mark them verified.
+
+`diagnostics` reads an existing database in read-only mode. A missing or older
+schema is a visible refusal: this command does not create a database and does
+not migrate one. Role output is extract, review, plan, and private availability
+from the current engines. Configured model ids stay separate from reported
+ones. Actual, estimated, unknown, and legacy usage stay distinct. Credentials
+and endpoint URLs are redacted. Model names are not.
 """
 
 from __future__ import annotations
@@ -26,6 +33,7 @@ import re
 import shutil
 import sqlite3
 import sys
+from collections.abc import Mapping
 from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -47,6 +55,31 @@ def _sibling(name: str) -> Any:
     sys.modules[mod_name] = mod
     spec.loader.exec_module(mod)
     return mod
+
+
+def _module(name: str) -> Any:
+    """Reuse a module the process already loaded, otherwise the canonical sibling."""
+    for key in (name, f"snowball_{name}"):
+        loaded = sys.modules.get(key)
+        if loaded is not None:
+            return loaded
+    return _sibling(name)
+
+
+def _try_module(name: str) -> Any:
+    try:
+        return _module(name)
+    except Exception:
+        return None
+
+
+def _connect_readonly(path: Path) -> sqlite3.Connection:
+    """Open an existing database without creating or migrating it."""
+    uri = path.resolve().as_uri() + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only=ON")
+    return conn
 
 
 def classify_heuristic(text: str, html: str | None = None) -> str:
@@ -295,8 +328,22 @@ def eval_digest(
             "error": "database not found",
         }
 
-    conn = sqlite3.connect(p_db)
-    conn.row_factory = sqlite3.Row
+    try:
+        conn = _connect_readonly(p_db)
+    except sqlite3.Error:
+        if not quiet:
+            print(f"Database at {p_db} is not readable.", file=sys.stderr)
+        return {
+            "total_items": 0,
+            "total_quotes": 0,
+            "valid_quotes": 0,
+            "valid_urls": 0,
+            "production_delivery_check": True,
+            "method": "source_text_verbatim",
+            "passed": False,
+            "message_id": False,
+            "error": "database unreadable",
+        }
     cur = conn.cursor()
     has_table = bool(
         cur.execute(
@@ -791,7 +838,10 @@ class GateEvidenceError(Exception):
 
 
 def expected_gate_ids() -> list[str]:
-    """44 Fable gates plus access gates A01-A15."""
+    """44 Fable gates plus access gates A01-A15.
+
+    Goal-harness scenario ids G01-G30 are not rows in this ledger.
+    """
     ids = ["M0.01"]
     ids.extend(f"M1.{i:02d}" for i in range(1, 13))
     ids.extend(f"M2.{i:02d}" for i in range(1, 13))
@@ -1026,9 +1076,13 @@ def check_live_gate_prerequisites(gate_id: str, db_path: Path | None = None) -> 
     p_db = db_path or DB_PATH
 
     if gate_id == "M3.08":
-        if not p_db.exists():
-            return False, f"database {p_db} does not exist"
-        conn = sqlite3.connect(p_db)
+        report = inspect_database(p_db)
+        if report.get("code"):
+            return False, str(report.get("message") or report["code"])
+        try:
+            conn = _connect_readonly(p_db)
+        except sqlite3.Error:
+            return False, "database unreadable"
         try:
             has_wiki = bool(
                 conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='wiki_fts'").fetchone()
@@ -1041,9 +1095,13 @@ def check_live_gate_prerequisites(gate_id: str, db_path: Path | None = None) -> 
         return True, None
 
     if gate_id == "M4.08":
-        if not p_db.exists():
-            return False, f"database {p_db} does not exist"
-        conn = sqlite3.connect(p_db)
+        report = inspect_database(p_db)
+        if report.get("code"):
+            return False, str(report.get("message") or report["code"])
+        try:
+            conn = _connect_readonly(p_db)
+        except sqlite3.Error:
+            return False, "database unreadable"
         try:
             has_items = bool(
                 conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='digest_items'").fetchone()
@@ -1135,190 +1193,1221 @@ def run_live_gate(
     )
 
 
+REQUIRED_SCHEMA_VERSION = 4
+_REQUIRED_TABLES = (
+    "topics",
+    "topics_fts",
+    "entities",
+    "claims",
+    "digest_items",
+    "model_calls",
+    "observations",
+    "source_snapshots",
+    "profile_fields",
+)
+_PUBLIC_TRANSPORTS = frozenset({"agy", "omp", "ssh-omp", "api", "gemini", "openrouter", "public", "ssh"})
+_CURRENT_AGGREGATE_ENGINES = frozenset({"gemini", "local", "review", "plan"})
+_ROLE_ENGINES = (
+    ("extract", "GeminiBulkExtractor"),
+    ("review", "ReviewEngine"),
+    ("plan", "ReviewEngine"),
+    ("private_eval", "LocalPrivateEngine"),
+)
+_ROLE_MODEL_FIELDS = {
+    "extract": "gemini_model",
+    "review": "review_model",
+    "plan": "plan_model",
+    "private_eval": "private_model_id",
+}
+_PRIVATE_FIELD_KEYS = frozenset(
+    {
+        "max_upfront_cash",
+        "min_living_adequacy_rule",
+        "max_work_hours_acceptable",
+        "citizenship",
+        "prior_degree",
+        "academic_record",
+        "tests",
+        "accept_conditional_ra_ta",
+        "accept_competitive_awards",
+        "gpa",
+        "profile",
+        "profile_snapshot",
+        "profile_snapshot_json",
+        "profile_snapshot_hash",
+        "private_hash",
+        "value_json",
+    }
+)
+_DROP_KEY_EXACT = frozenset(
+    {
+        "api_key",
+        "apikey",
+        "authorization",
+        "password",
+        "secret",
+        "endpoint",
+        "private_model_endpoint",
+        "local_base_url",
+        "base_url",
+        "gemini_api_key",
+        "local_api_key",
+        "value_json",
+        "profile_snapshot",
+        "profile_snapshot_json",
+        "profile_snapshot_hash",
+        "proxy",
+        "credential",
+        "attestation_secret",
+    }
+)
+_HEALTHY_DIAGNOSTIC = frozenset({"ok", "reported", "unexercised", "pass"})
+_PUBLIC_ENDPOINT_HOSTS = frozenset(
+    {
+        "generativelanguage.googleapis.com",
+        "aiplatform.googleapis.com",
+        "api.openai.com",
+        "openrouter.ai",
+    }
+)
+_USAGE_KIND_TO_MODE = {
+    "actual": "actual",
+    "estimated": "estimated",
+    "legacy": "legacy",
+    "unknown": "unknown",
+    "provider_reported": "actual",
+    "daemon_reported": "actual",
+}
+_PRIVATE_REASON_KEEP = frozenset(
+    {"local_model_required", "public_transport_rejected", "not_configured", "unavailable"}
+)
+
+
+def _has_table(conn: sqlite3.Connection, name: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (name,),
+        ).fetchone()
+        is not None
+    )
+
+
+def _observed_schema_version(conn: sqlite3.Connection) -> int | None:
+    migration = _try_module("migration")
+    reader = getattr(migration, "schema_version", None) if migration is not None else None
+    if callable(reader):
+        try:
+            return int(reader(conn))
+        except (TypeError, ValueError):
+            return None
+        except Exception:
+            return None
+    try:
+        row = conn.execute(
+            "SELECT value FROM schema_meta WHERE key='schema_version'"
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None:
+        return 0
+    try:
+        return int(row[0])
+    except (TypeError, ValueError):
+        return None
+
+
+def inspect_database(path: Path) -> dict[str, Any]:
+    """Read schema identity. Never creates a file and never migrates."""
+    required = REQUIRED_SCHEMA_VERSION
+    if not path.exists() or not path.is_file():
+        return {
+            "status": "refused",
+            "code": "database_missing",
+            "observed_version": None,
+            "required_version": required,
+            "missing_tables": [],
+            "created": False,
+            "migrated": False,
+            "message": "Database does not exist. Diagnostics did not create it and did not migrate.",
+        }
+    try:
+        conn = _connect_readonly(path)
+    except sqlite3.Error:
+        return {
+            "status": "refused",
+            "code": "database_unreadable",
+            "observed_version": None,
+            "required_version": required,
+            "missing_tables": [],
+            "created": False,
+            "migrated": False,
+            "message": "Database is not readable. Diagnostics did not create or migrate it.",
+        }
+    try:
+        observed = _observed_schema_version(conn)
+        missing = [name for name in _REQUIRED_TABLES if not _has_table(conn, name)]
+    finally:
+        conn.close()
+    if observed != required or missing:
+        return {
+            "status": "refused",
+            "code": "migration_required",
+            "observed_version": observed,
+            "required_version": required,
+            "missing_tables": missing,
+            "created": False,
+            "migrated": False,
+            "message": (
+                "Schema migration required; diagnostics did not create or migrate this database. "
+                "Run the explicit migrate command with services stopped."
+            ),
+        }
+    return {
+        "status": "ok",
+        "code": None,
+        "observed_version": observed,
+        "required_version": required,
+        "missing_tables": [],
+        "created": False,
+        "migrated": False,
+        "message": "Schema version 4 is current. Diagnostics did not migrate.",
+    }
+
+
+def exercise_ledger(rows: list[dict[str, Any]]) -> dict[str, list[str]]:
+    """Split an already-recorded legacy ledger into pass, fail, and unexercised.
+
+    Unknown ids, including goal-harness G01-G30, are ignored rather than added.
+    """
+    buckets: dict[str, list[str]] = {"pass": [], "fail": [], "unexercised": []}
+    known = set(expected_gate_ids())
+    for row in rows:
+        gate_id = str(row.get("gate_id") or "")
+        if gate_id not in known:
+            continue
+        buckets[_exercise_state(row)].append(gate_id)
+    return buckets
+
+
+def _exercise_state(row: dict[str, Any]) -> str:
+    status = row.get("status")
+    finished = bool(row.get("finished_at"))
+    exit_code = row.get("exit_code")
+    if status in VERIFIED_STATUSES:
+        if exit_code == 0 and row.get("evidence_path") and finished:
+            return "pass"
+        return "fail"
+    if finished and exit_code is not None:
+        return "fail"
+    return "unexercised"
+
+
+def _sensitive_key(key: str) -> bool:
+    lowered = key.lower().replace("-", "_")
+    if lowered in _DROP_KEY_EXACT:
+        return True
+    return lowered.endswith(("_api_key", "_password", "_secret", "_endpoint"))
+
+
+def _scrub(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _scrub(item) for key, item in value.items() if not _sensitive_key(str(key))}
+    if isinstance(value, (list, tuple)):
+        return [_scrub(item) for item in value]
+    if isinstance(value, str):
+        return redact_text(value)
+    return value
+
+
+def _public_model(model_id: object) -> str:
+    """Keep a model id. Credentials are redacted later; names are not blanked."""
+    if not isinstance(model_id, str):
+        return ""
+    return model_id.strip()[:200]
+
+
+def _cfg_model(cfg: Any, name: str) -> str:
+    """Read one canonical config field. A missing field is unset, not aliased."""
+    if cfg is None:
+        return ""
+    try:
+        value = cfg.__getattribute__(name)
+    except AttributeError:
+        return ""
+    return _public_model(value)
+
+
+def _loopback_host(host: str) -> bool:
+    lowered = host.strip().lower().rstrip(".")
+    return (
+        lowered in {"localhost", "::1", "0.0.0.0", "ip6-localhost", "ip6-loopback"}
+        or lowered.startswith("127.")
+        or lowered.startswith("::ffff:127.")
+    )
+
+
+def _endpoint_host_class(host: object, port: object, transport: str) -> str:
+    if not isinstance(host, str) or not host.strip():
+        return "absent"
+    if _loopback_host(host):
+        return "loopback"
+    if host.strip().lower().rstrip(".") in _PUBLIC_ENDPOINT_HOSTS:
+        return "public"
+    if isinstance(port, int) and not isinstance(port, bool) and port == 8088:
+        return "public"
+    if transport in _PUBLIC_TRANSPORTS:
+        return "public"
+    return "private"
+
+
+def _absorb_engine_status(raw: dict[str, Any]) -> dict[str, Any]:
+    """Translate engine diagnostics() into the public role shape.
+
+    Endpoint host, port, and URL are classified and then dropped. A hard cap
+    requires the engine's attested adapter conformance. A billing flag or a
+    response count does not. Estimated AGY/OMP usage stays estimated.
+    """
+    if "model_id" in raw:
+        model_id = _public_model(raw.get("model_id"))
+    else:
+        model_id = _public_model(raw.get("model"))
+    if raw.get("usage_mode") in {"actual", "estimated", "legacy", "unknown"}:
+        usage_mode = raw["usage_mode"]
+    else:
+        usage_mode = _USAGE_KIND_TO_MODE.get(str(raw.get("usage_kind") or "unknown"), "unknown")
+    producer = "hard_cap" in raw or "conformance" in raw or "billing_ceiling" in raw
+    if raw.get("hard_cap") == "attested" and raw.get("conformance") == "attested":
+        conformance = True
+        hard_cap = True
+    elif producer:
+        conformance = False
+        hard_cap = False
+    else:
+        claimed = bool(raw.get("conformance_attested")) and bool(raw.get("hard_provider_cap"))
+        conformance = bool(claimed and usage_mode == "actual")
+        hard_cap = conformance
+    if str(raw.get("endpoint_host_class") or "") in {"absent", "loopback", "public", "private"}:
+        host_class = str(raw["endpoint_host_class"])
+    else:
+        host_class = _endpoint_host_class(
+            raw.get("endpoint_host"),
+            raw.get("endpoint_port"),
+            str(raw.get("transport") or "").strip().lower(),
+        )
+    attested_local = bool(raw.get("attested_local"))
+    if host_class == "loopback":
+        attested_local = False
+    if "isolation_documented" in raw:
+        isolation = bool(raw.get("isolation_documented"))
+    else:
+        isolation = bool(attested_local and host_class == "private")
+    return {
+        "engine": raw.get("engine"),
+        "configured": raw.get("configured"),
+        "available": raw.get("available"),
+        "reason": raw.get("reason"),
+        "model_id": model_id,
+        "transport": raw.get("transport"),
+        "usage_mode": usage_mode,
+        "hard_provider_cap": hard_cap,
+        "conformance_attested": conformance,
+        "attested_local": attested_local,
+        "isolation_documented": isolation,
+        "endpoint_host_class": host_class,
+    }
+
+
+def _blank_role(role: str, engine: str, reason: str) -> dict[str, Any]:
+    item: dict[str, Any] = {
+        "role": role,
+        "engine": engine,
+        "configured": False,
+        "available": False,
+        "reason": reason,
+        "model_id": "",
+        "transport": "",
+        "usage_mode": "unknown",
+        "hard_provider_cap": False,
+        "attested_local": False,
+        "conformance_attested": False,
+        "isolation_documented": False,
+    }
+    if role == "private_eval":
+        item["endpoint_host_class"] = "absent"
+    return item
+
+
+def _normalize_role(role: str, engine: str, raw: Any) -> dict[str, Any]:
+    item = _blank_role(role, engine, "unconfigured")
+    if isinstance(raw, dict):
+        raw = _absorb_engine_status(raw)
+        reported_engine = str(raw.get("engine") or engine)[:80]
+        item["engine"] = reported_engine
+        item["configured"] = bool(raw.get("configured"))
+        item["available"] = bool(raw.get("available"))
+        item["reason"] = str(raw.get("reason") or item["reason"])[:300]
+        item["model_id"] = _public_model(raw.get("model_id"))
+        item["transport"] = str(raw.get("transport") or "")[:80]
+        usage = raw.get("usage_mode")
+        item["usage_mode"] = usage if usage in {"actual", "estimated", "legacy", "unknown"} else "unknown"
+        item["attested_local"] = bool(raw.get("attested_local"))
+        item["conformance_attested"] = bool(raw.get("conformance_attested"))
+        item["isolation_documented"] = bool(raw.get("isolation_documented"))
+        item["hard_provider_cap"] = bool(raw.get("hard_provider_cap")) and item["conformance_attested"]
+        if role == "private_eval":
+            host_class = str(raw.get("endpoint_host_class") or "absent")
+            if host_class not in {"absent", "loopback", "public", "private"}:
+                host_class = "absent"
+            item["endpoint_host_class"] = host_class
+    if not item["model_id"]:
+        item["configured"] = False
+    if not item["conformance_attested"]:
+        item["hard_provider_cap"] = False
+    transport = item["transport"].strip().lower()
+    if role == "private_eval":
+        host_class = str(item.get("endpoint_host_class") or "absent")
+        item["hard_provider_cap"] = False
+        item["conformance_attested"] = False
+        proven = (
+            item["available"]
+            and item["attested_local"]
+            and item["isolation_documented"]
+            and host_class == "private"
+            and bool(transport)
+            and transport not in _PUBLIC_TRANSPORTS
+            and bool(item["model_id"])
+        )
+        if host_class == "public" or transport in _PUBLIC_TRANSPORTS:
+            item["available"] = False
+            item["attested_local"] = False
+            item["isolation_documented"] = False
+            item["reason"] = "public_transport_rejected"
+        elif host_class == "loopback" or not proven:
+            item["available"] = False
+            item["attested_local"] = False
+            kept = _PRIVATE_REASON_KEEP | {"dry", "ok", "attested"}
+            if host_class == "loopback" or item["reason"] not in kept:
+                item["reason"] = "local_model_required"
+        elif item["reason"] in {"", "unconfigured", "unavailable"}:
+            item["reason"] = "attested"
+    else:
+        item["attested_local"] = False
+        item["isolation_documented"] = False
+    return item
+
+
+def _mapping_dict(raw: Any) -> dict[str, Any] | None:
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, Mapping):
+        return {str(key): value for key, value in raw.items()}
+    return None
+
+
+def _probe_engine(cls: type, cfg: Any, live: bool) -> dict[str, Any] | None:
+    """Call the typed diagnostics and available methods. Neither invents the other."""
+    try:
+        engine = cls(cfg, dry=not live)
+    except Exception:
+        return None
+    try:
+        diagnose = engine.diagnostics
+        probe = engine.available
+    except AttributeError:
+        return None
+    if not callable(diagnose) or not callable(probe):
+        return None
+    try:
+        raw = diagnose()
+    except Exception:
+        return None
+    mapped = _mapping_dict(raw)
+    if mapped is None:
+        return {
+            "available": False,
+            "configured": False,
+            "reason": "diagnostics_unavailable",
+            "usage_mode": "unknown",
+        }
+    merged = dict(mapped)
+    try:
+        ok, reason = probe()
+    except Exception:
+        ok, reason = False, "unavailable"
+    if not isinstance(ok, bool):
+        ok = False
+    diagnosed = merged.get("available") is True
+    if not diagnosed or not ok:
+        merged["available"] = False
+        if diagnosed and isinstance(reason, str) and reason.strip():
+            merged["reason"] = reason.strip()[:300]
+        elif "available" not in mapped and not isinstance(merged.get("reason"), str):
+            merged["reason"] = "diagnostics_unavailable"
+    return merged
+
+
+def _call_role_diagnostics(cfg: Any, live: bool) -> dict[str, Any] | None:
+    """Ask the current engines whether each role is available.
+
+    Constructors are ``(cfg, dry=not live)``. Only ``diagnostics()`` and
+    ``available()`` are called. extract/review/plan/private_eval would dispatch
+    a model and are never used here.
+    """
+    transport = _try_module("engine_transport")
+    if transport is None:
+        return None
+    try:
+        extract_cls = transport.GeminiBulkExtractor
+        review_cls = transport.ReviewEngine
+        private_cls = transport.LocalPrivateEngine
+    except AttributeError:
+        return {"_error": "engine_transport_unavailable"}
+    if not all(isinstance(cls, type) for cls in (extract_cls, review_cls, private_cls)):
+        return {"_error": "engine_transport_unavailable"}
+    return {
+        "extract": _probe_engine(extract_cls, cfg, live),
+        "review": _probe_engine(review_cls, cfg, live),
+        "plan": _probe_engine(review_cls, cfg, live),
+        "private_eval": _probe_engine(private_cls, cfg, live),
+    }
+
+
+def _diagnostic_cfg(cfg: Any | None, live: bool) -> Any:
+    if cfg is not None:
+        return cfg
+    orch = _try_module("orchestrator")
+    if orch is None:
+        return None
+    if live and hasattr(orch, "load_config"):
+        try:
+            return orch.load_config()
+        except Exception:
+            pass
+    config_type = getattr(orch, "Config", None)
+    if isinstance(config_type, type):
+        return config_type()
+    return None
+
+
+def _finish_role(role: str, item: dict[str, Any], cfg: Any) -> dict[str, Any]:
+    """Record the configured model separately from the engine-reported model.
+
+    An empty canonical field does not inherit an engine default. That keeps an
+    unset review role from being labeled with the engine's Claude fallback.
+    """
+    requested = _cfg_model(cfg, _ROLE_MODEL_FIELDS[role])
+    reported = _public_model(item.get("model_id"))
+    item["requested_model"] = requested
+    if role != "private_eval" and not requested:
+        item["configured"] = False
+        item["available"] = False
+        item["model_id"] = ""
+        item["reported_model"] = ""
+        item["transport"] = ""
+        item["usage_mode"] = "unknown"
+        item["hard_provider_cap"] = False
+        item["conformance_attested"] = False
+        item["attested_local"] = False
+        item["isolation_documented"] = False
+        item["reason"] = "not_configured"
+        return item
+    item["reported_model"] = reported
+    item["model_id"] = reported
+    return item
+
+
+def role_report(cfg: Any | None = None, *, live: bool = False) -> dict[str, Any]:
+    """Public role availability. Estimated usage is not a system-wide hard cap."""
+    cfg = _diagnostic_cfg(cfg, live)
+    raw_map = _call_role_diagnostics(cfg, live)
+    roles: dict[str, Any] = {}
+    for role, engine in _ROLE_ENGINES:
+        raw = None if not isinstance(raw_map, dict) else raw_map.get(role)
+        if not isinstance(raw, dict):
+            if isinstance(raw_map, dict) and raw_map.get("_error"):
+                reason = str(raw_map["_error"])
+            elif raw_map is None:
+                reason = "engine_transport_unavailable"
+            else:
+                reason = "unconfigured"
+            raw = {"available": False, "reason": reason, "configured": False, "usage_mode": "unknown"}
+        roles[role] = _finish_role(role, _normalize_role(role, engine, raw), cfg)
+    public = [roles[name] for name in ("extract", "review", "plan")]
+    hard_cap = bool(public) and all(
+        role["hard_provider_cap"] and role["conformance_attested"] and role["usage_mode"] == "actual"
+        for role in public
+    )
+    blocked = any(not roles[name]["available"] for name in ("extract", "review", "plan", "private_eval"))
+    return {
+        "status": "blocked" if blocked else "reported",
+        "network_check": "exercised" if live else "unexercised",
+        "hard_provider_cap": hard_cap,
+        **roles,
+    }
+
+
+def reject_canary_reply(text: str, canary: str) -> None:
+    """Refuse a model reply that contains the active canary. The token is not echoed."""
+    if not isinstance(text, str) or not isinstance(canary, str) or not canary:
+        raise ValueError("canary reply")
+    leaked = canary in text
+    if not getattr(reject_canary_reply, "_inside", False):
+        transport = _try_module("engine_transport")
+        fn = getattr(transport, "reject_canary_reply", None) if transport is not None else None
+        if callable(fn) and fn is not reject_canary_reply:
+            setattr(reject_canary_reply, "_inside", True)
+            try:
+                fn(text, canary)
+            except Exception:
+                leaked = True
+            finally:
+                setattr(reject_canary_reply, "_inside", False)
+    if leaked:
+        sanitizer = _try_module("sanitizer")
+        incident = getattr(sanitizer, "SecurityIncident", None) if sanitizer is not None else None
+        if incident is None:
+            raise RuntimeError("canary-leak")
+        raise incident("canary-leak", {})
+
+
+def judge_evidence(source_text: str, quote: str, provenance: str = "public_fetch") -> dict[str, Any]:
+    """Accept a verbatim public quote. Injection, private provenance, and invented quotes are refused."""
+    if not isinstance(source_text, str) or not isinstance(quote, str):
+        return {"accepted": False, "code": "schema_refused", "hits": []}
+    if (provenance or "").strip().lower() != "public_fetch":
+        return {"accepted": False, "code": "provenance_refused", "hits": []}
+    quarantine = _try_module("quarantine")
+    scan = getattr(quarantine, "scan_text", None) if quarantine is not None else None
+    hits: list[str] = []
+    if callable(scan):
+        hits = sorted(set(scan(source_text)) | set(scan(quote)))
+    if hits:
+        return {"accepted": False, "code": "quarantine", "hits": hits}
+    if not quote.strip():
+        return {"accepted": False, "code": "quote_mismatch", "hits": []}
+    orch = _try_module("orchestrator")
+    quote_ok = getattr(orch, "quote_ok", None) if orch is not None else None
+    if callable(quote_ok):
+        ok, _start, _end = quote_ok(quote, source_text)
+    else:
+        ok = quote in source_text
+    if not ok:
+        return {"accepted": False, "code": "quote_mismatch", "hits": []}
+    return {"accepted": True, "code": "kept", "hits": []}
+
+
+_SAFE_FIELD_KEY_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_HASH_VALUE_RE = re.compile(r"^[0-9a-f]{64}$")
+_PROVENANCE_REFUSAL_KEYS = frozenset(
+    {
+        "provenance",
+        "visibility",
+        "origin",
+        "discovered_via",
+        "human_note",
+        "human_notes",
+        "private",
+        "unknown",
+        "private_profile",
+        "interview",
+        "user_stated",
+        "user_confirmed",
+        "imported_history",
+        "system_default",
+    }
+)
+_BAD_PROVENANCE_VALUES = _PROVENANCE_REFUSAL_KEYS - {
+    "provenance",
+    "visibility",
+    "origin",
+    "discovered_via",
+}
+_REQUEST_KEY_REFUSALS = _BAD_PROVENANCE_VALUES | frozenset(
+    {
+        "contract_hash",
+        "body_hash",
+        "private_hash",
+        "profile_snapshot_hash",
+    }
+)
+
+
+def _safe_field_key(value: Any) -> str | None:
+    """Keep a refusal key. Drop values, hashes, and messages that are not keys."""
+    if not isinstance(value, str) or _SAFE_FIELD_KEY_RE.fullmatch(value) is None:
+        return None
+    if _HASH_VALUE_RE.fullmatch(value):
+        return None
+    return value
+
+
+def _request_refusal(field_key: str | None) -> dict[str, Any]:
+    safe = _safe_field_key(field_key)
+    if safe in _PROVENANCE_REFUSAL_KEYS:
+        code = "provenance_refused"
+    else:
+        code = "schema_refused"
+    return {"accepted": False, "code": code, "field_key": safe}
+
+
+def _first_disallowed_key(value: Any) -> str | None:
+    """Name a disallowed key. Amounts and other payload values are not inspected."""
+    if isinstance(value, dict):
+        provenance = value.get("provenance")
+        if isinstance(provenance, str) and provenance != "public_fetch":
+            return "provenance"
+        visibility = value.get("visibility")
+        if isinstance(visibility, str) and visibility != "public":
+            return "visibility"
+        for key, item in value.items():
+            folded = str(key).casefold()
+            if folded in {"origin", "discovered_via"} and (
+                not isinstance(item, str) or item.casefold() in _BAD_PROVENANCE_VALUES
+            ):
+                return folded
+            if folded in _PRIVATE_FIELD_KEYS or folded in _REQUEST_KEY_REFUSALS:
+                return folded
+            found = _first_disallowed_key(item)
+            if found:
+                return found
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            found = _first_disallowed_key(item)
+            if found:
+                return found
+    return None
+
+
+def assess_public_request(request: Any) -> dict[str, Any]:
+    """Refuse a private or malformed request before any public prompt is built.
+
+    Typed requests are decided by snowball_prompts.validate_public_request.
+    PrivacyViolation contributes its field key only. A public amount such as
+    tuition 0 is not a private-value scan. This function does not compile a prompt.
+    """
+    if isinstance(request, (dict, list, tuple)):
+        field_key = _first_disallowed_key(request)
+        if field_key is None:
+            field_key = "request"
+        return _request_refusal(field_key)
+    prompts = _try_module("prompts")
+    validate = getattr(prompts, "validate_public_request", None) if prompts is not None else None
+    privacy = getattr(prompts, "PrivacyViolation", None) if prompts is not None else None
+    if not callable(validate):
+        return {"accepted": False, "code": "unexercised", "field_key": None}
+    allowed = tuple(
+        cls
+        for cls in (
+            getattr(prompts, "PublicModelRequest", None),
+            getattr(prompts, "PublicSearchRequest", None),
+        )
+        if isinstance(cls, type)
+    )
+    if allowed and not isinstance(request, allowed):
+        return _request_refusal("request")
+    try:
+        validate(request)
+    except Exception as exc:
+        if not isinstance(privacy, type) or not isinstance(exc, privacy):
+            return {"accepted": False, "code": "schema_refused", "field_key": None}
+        field_key = getattr(exc, "field_key", None)
+        if field_key != str(exc):
+            return {"accepted": False, "code": "schema_refused", "field_key": None}
+        return _request_refusal(field_key)
+    return {"accepted": True, "code": "public", "field_key": None}
+
+
+def robots_path_allowed(robots_txt: str, path: str) -> bool:
+    """Apply the production robots rule to a supplied body. This does not fetch."""
+    if not isinstance(robots_txt, str) or not isinstance(path, str):
+        raise TypeError("robots policy")
+    orch = _try_module("orchestrator")
+    owner = getattr(orch, "SnowballOrchestrator", None) if orch is not None else None
+    method = getattr(owner, "_robots_allows", None)
+    if not callable(method):
+        raise RuntimeError("robots policy unavailable")
+    probe = type("RobotsProbe", (), {})()
+    probe.robots_cache = {"https://policy.test": robots_txt}
+    return bool(method(probe, "https://policy.test", path))
+
+
+def paid_tariff_block_reason(caps: dict[str, Any], provider: str = "zenrows") -> str:
+    """Ask the paid-budget ledger whether this tariff can reserve spend."""
+    budget = _try_module("paid_budget")
+    reserve = getattr(budget, "reserve", None) if budget is not None else None
+    if not callable(reserve):
+        return "unexercised"
+    try:
+        reserve(None, "diag-paid-0", provider, 1, False, caps)
+    except Exception as exc:
+        text = str(exc).splitlines()[0][:200]
+        return f"{type(exc).__name__}:{text}" if text else type(exc).__name__
+    return "reserved"
+
+
+def _ssrf_report() -> dict[str, Any]:
+    orch = _try_module("orchestrator")
+    pin = getattr(orch, "resolve_and_pin", None) if orch is not None else None
+    if not callable(pin):
+        return {"status": "unexercised", "enforcing": False}
+    try:
+        pin("127.0.0.1", 443)
+    except Exception:
+        return {"status": "pass", "enforcing": True}
+    return {"status": "fail", "enforcing": False}
+
+
+def _paid_report(policy_path: Path | None) -> dict[str, Any]:
+    path = policy_path or (ROOT / "access.example.yml")
+    daily: int | None = None
+    tariffs: dict[str, int] = {}
+    policy = _try_module("access_policy")
+    loader = getattr(policy, "load_access_policy", None) if policy is not None else None
+    if callable(loader) and path.is_file():
+        try:
+            caps = loader(path).caps()
+            if isinstance(caps.get("daily_micro_usd"), int):
+                daily = caps["daily_micro_usd"]
+            raw_tariffs = caps.get("tariffs") or {}
+            if isinstance(raw_tariffs, dict):
+                tariffs = {
+                    str(name): amount
+                    for name, amount in raw_tariffs.items()
+                    if isinstance(amount, int) and not isinstance(amount, bool)
+                }
+        except Exception:
+            return {"status": "unexercised", "blocked": False, "reason": "unexercised", "daily_micro_usd": None}
+    if not tariffs:
+        tariffs = {"zenrows": 0}
+        if daily is None:
+            daily = 0
+    reasons: list[str] = []
+    blocked = isinstance(daily, int) and daily == 0
+    for name, amount in tariffs.items():
+        if amount != 0:
+            blocked = False
+        reason = paid_tariff_block_reason({"tariffs": {name: amount}}, name)
+        reasons.append(reason)
+        if not str(reason).startswith("PaidBudgetExhausted:tariff_disabled"):
+            blocked = False
+    return {
+        "status": "pass" if blocked else "fail",
+        "blocked": blocked,
+        "reason": reasons[0] if reasons else "unexercised",
+        "daily_micro_usd": daily,
+    }
+
+
+def _access_report(live: bool, policy_path: Path | None) -> dict[str, Any]:
+    ssrf = _ssrf_report()
+    robots_state = "unexercised"
+    robots_ok = False
+    try:
+        blocked = robots_path_allowed("User-agent: *\nDisallow: /private\n", "/private") is False
+        opened = robots_path_allowed("User-agent: *\nDisallow: /private\n", "/public") is True
+        robots_ok = blocked and opened
+        robots_state = "enforcing" if robots_ok else "failed"
+    except Exception:
+        robots_state = "unexercised"
+    paid = _paid_report(policy_path)
+    if ssrf["status"] == "fail" or robots_state == "failed" or paid["status"] == "fail":
+        status = "failed"
+    elif ssrf["enforcing"] and robots_ok and paid["blocked"]:
+        status = "ok"
+    else:
+        status = "blocked"
+    return {
+        "status": status,
+        "live_checked": bool(live),
+        "ssrf_guard": "enforcing" if ssrf["enforcing"] else ssrf["status"],
+        "robots": robots_state,
+        "paid_ceiling_micro_usd": paid.get("daily_micro_usd"),
+        "paid_route": "disabled" if paid["blocked"] else "not_disabled",
+        "paid_block": paid.get("reason"),
+        "mode": "offline_policy_verified" if not live else "live_role_check",
+    }
+
+
+def _count(conn: sqlite3.Connection, table: str) -> int:
+    if not _has_table(conn, table):
+        return 0
+    return int(conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
+
+
+def _topic_report(conn: sqlite3.Connection) -> dict[str, Any]:
+    has_topics = _has_table(conn, "topics")
+    has_fts = _has_table(conn, "topics_fts")
+    details: dict[str, Any] = {"topics": _count(conn, "topics"), "topics_fts": _count(conn, "topics_fts")}
+    if not has_topics or not has_fts:
+        details["status"] = "blocked"
+        details["error"] = "missing topics or topics_fts table"
+        return details
+    details["status"] = "ok"
+    return details
+
+
+def _extraction_report(conn: sqlite3.Connection) -> dict[str, Any]:
+    has_ent = _has_table(conn, "entities")
+    has_claims = _has_table(conn, "claims")
+    details: dict[str, Any] = {"entities": _count(conn, "entities"), "claims": _count(conn, "claims")}
+    if not has_ent or not has_claims:
+        details["status"] = "blocked"
+        details["error"] = "missing entities or claims table"
+        return details
+    details["status"] = "ok"
+    return details
+
+
+def _digest_report(conn: sqlite3.Connection) -> dict[str, Any]:
+    has_di = _has_table(conn, "digest_items")
+    has_ent = _has_table(conn, "entities")
+    premature = 0
+    if has_ent and has_di:
+        premature = int(
+            conn.execute(
+                "SELECT count(*) FROM entities WHERE reported_at IS NOT NULL "
+                "AND key NOT IN (SELECT ref_id FROM digest_items WHERE message_id IS NOT NULL)"
+            ).fetchone()[0]
+        )
+    details: dict[str, Any] = {
+        "digest_items": _count(conn, "digest_items"),
+        "premature_acknowledgements": premature,
+        "status": "failed" if premature else "ok",
+    }
+    if premature:
+        details["error"] = "premature delivery acknowledgement detected"
+    return details
+
+
+def _field_report(conn: sqlite3.Connection) -> dict[str, Any]:
+    public_keys: list[str] = []
+    private_count = 0
+    if _has_table(conn, "profile_fields"):
+        public_keys = [
+            str(row[0])
+            for row in conn.execute(
+                "SELECT key FROM profile_fields WHERE visibility = 'public_ok' ORDER BY key"
+            )
+            if row[0] is not None and str(row[0]) not in _PRIVATE_FIELD_KEYS
+        ]
+        private_count = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM profile_fields WHERE visibility IS NULL OR visibility != 'public_ok'"
+            ).fetchone()[0]
+        )
+    observations = []
+    if _has_table(conn, "observations"):
+        observations = [
+            {"field_key": str(row[0]), "assurance": str(row[1]), "count": int(row[2])}
+            for row in conn.execute(
+                "SELECT field_key, assurance, COUNT(*) FROM observations "
+                "GROUP BY field_key, assurance ORDER BY field_key, assurance"
+            )
+            if row[0] is not None and str(row[0]) not in _PRIVATE_FIELD_KEYS
+        ]
+    sources = []
+    if _has_table(conn, "source_snapshots"):
+        sources = [
+            {"provenance": str(row[0]), "visibility": str(row[1]), "count": int(row[2])}
+            for row in conn.execute(
+                "SELECT provenance, visibility, COUNT(*) FROM source_snapshots "
+                "GROUP BY provenance, visibility ORDER BY provenance, visibility"
+            )
+        ]
+    exercised = bool(observations or sources or public_keys or private_count)
+    return {
+        "status": "reported" if exercised else "unexercised",
+        "public_field_keys": public_keys,
+        "private_profile_fields": private_count,
+        "observations": observations,
+        "sources": sources,
+    }
+
+
+def _legacy_helpers() -> tuple[Any, Any]:
+    transport = _try_module("engine_transport")
+    if transport is None:
+        return None, None
+    try:
+        classify = transport.classify_legacy_usage
+        reported = transport.reported_model_for_legacy
+    except AttributeError:
+        return None, None
+    if not callable(classify) or not callable(reported):
+        return None, None
+    return classify, reported
+
+
+def _call_identity(
+    transport_name: str,
+    requested: object,
+    reported: object,
+    usage_kind: object,
+    classify: Any,
+    reported_fn: Any,
+) -> tuple[str, str, str]:
+    """Keep requested and reported names. Historical grok is not relabeled Claude."""
+    requested_text = _public_model(requested)
+    reported_text = reported if isinstance(reported, str) else None
+    kind = str(usage_kind or "")
+    if transport_name == "grok":
+        if callable(classify):
+            kind = str(classify("grok", reported_text, kind))
+        else:
+            kind = "unknown"
+        if callable(reported_fn):
+            shown = reported_fn("grok", reported_text)
+            reported_text = shown if isinstance(shown, str) else ""
+        else:
+            reported_text = _public_model(reported_text)
+    else:
+        reported_text = _public_model(reported_text)
+    if kind not in {"actual", "estimated", "legacy", "unknown"}:
+        kind = "unknown"
+    return kind, requested_text, reported_text
+
+
+def _add_usage(
+    by_role: dict[str, dict[str, Any]],
+    totals: dict[str, int],
+    role_name: str,
+    kind: str,
+    calls: int,
+    tokens_in: int,
+    tokens_out: int,
+    thinking: int,
+) -> None:
+    bucket = by_role.setdefault(role_name, {})
+    slot = bucket.setdefault(
+        kind,
+        {"calls": 0, "tokens_in": 0, "tokens_out": 0, "thinking_tokens": 0},
+    )
+    slot["calls"] += calls
+    slot["tokens_in"] += tokens_in
+    slot["tokens_out"] += tokens_out
+    slot["thinking_tokens"] += thinking
+    totals[kind] += calls
+
+
+def _usage_report(conn: sqlite3.Connection) -> dict[str, Any]:
+    totals = {"actual": 0, "estimated": 0, "legacy": 0, "unknown": 0}
+    by_role: dict[str, dict[str, Any]] = {}
+    identities: list[dict[str, Any]] = []
+    classify, reported_fn = _legacy_helpers()
+    if _has_table(conn, "model_calls"):
+        rows = conn.execute(
+            """
+            SELECT role, requested_model, reported_model, transport, usage_kind, COUNT(*),
+                   COALESCE(SUM(tokens_in), 0),
+                   COALESCE(SUM(tokens_out), 0),
+                   COALESCE(SUM(thinking_tokens), 0)
+            FROM model_calls
+            GROUP BY role, requested_model, reported_model, transport, usage_kind
+            """
+        )
+        for row in rows:
+            transport_name = str(row[3] or "")
+            kind, requested_text, reported_text = _call_identity(
+                transport_name, row[1], row[2], row[4], classify, reported_fn
+            )
+            role_name = str(row[0] or "")
+            calls = int(row[5])
+            tokens_in = int(row[6])
+            tokens_out = int(row[7])
+            thinking = int(row[8])
+            _add_usage(by_role, totals, role_name, kind, calls, tokens_in, tokens_out, thinking)
+            identities.append(
+                {
+                    "role": role_name,
+                    "requested_model": requested_text,
+                    "reported_model": reported_text,
+                    "transport": transport_name,
+                    "usage_kind": kind,
+                    "calls": calls,
+                    "tokens_in": tokens_in,
+                    "tokens_out": tokens_out,
+                    "thinking_tokens": thinking,
+                }
+            )
+    legacy_engines: list[dict[str, Any]] = []
+    if _has_table(conn, "engine_spend"):
+        grouped: dict[str, dict[str, int]] = {}
+        for row in conn.execute("SELECT engine, calls, tokens_in, tokens_out FROM engine_spend"):
+            engine_name = str(row[0] or "")
+            if engine_name in _CURRENT_AGGREGATE_ENGINES:
+                continue
+            slot = grouped.setdefault(engine_name, {"calls": 0, "tokens_in": 0, "tokens_out": 0})
+            slot["calls"] += int(row[1] or 0)
+            slot["tokens_in"] += int(row[2] or 0)
+            slot["tokens_out"] += int(row[3] or 0)
+        for engine_name in sorted(grouped):
+            slot = grouped[engine_name]
+            if engine_name == "grok":
+                kind = str(classify("grok", None, None)) if callable(classify) else "unknown"
+                if kind not in totals:
+                    kind = "unknown"
+            else:
+                kind = "legacy"
+            legacy_engines.append(
+                {
+                    "engine": engine_name,
+                    "attribution": "legacy",
+                    "usage_kind": kind,
+                    "calls": slot["calls"],
+                    "tokens_in": slot["tokens_in"],
+                    "tokens_out": slot["tokens_out"],
+                }
+            )
+    legacy_calls = sum(item["calls"] for item in legacy_engines)
+    legacy_in = sum(item["tokens_in"] for item in legacy_engines)
+    legacy_out = sum(item["tokens_out"] for item in legacy_engines)
+    exercised = sum(totals.values()) > 0 or legacy_calls > 0
+    return {
+        "status": "reported" if exercised else "unexercised",
+        "authoritative": "model_calls",
+        "hard_provider_cap": False,
+        "calls": totals,
+        "by_role": by_role,
+        "identities": identities,
+        "legacy_aggregates_are_not_role_attribution": True,
+        "legacy_engines": legacy_engines,
+        "legacy_aggregate_calls": legacy_calls,
+        "legacy_aggregate_tokens_in": legacy_in,
+        "legacy_aggregate_tokens_out": legacy_out,
+    }
+
+
+def _retention_report(path: Path, schema_ok: bool) -> dict[str, Any]:
+    target_dir = path.parent if path.parent.exists() else ROOT
+    free_bytes = shutil.disk_usage(target_dir).free
+    details: dict[str, Any] = {
+        "free_disk_gb": round(free_bytes / (1024**3), 2),
+        "floor_disk_gb": 5.0,
+        "status": "ok",
+    }
+    if free_bytes < 5 * (1024**3):
+        details["status"] = "blocked"
+        details["error"] = f"free disk space {details['free_disk_gb']}GB below 5GB floor"
+    backup_dirs = [ROOT / "data" / "backups", ROOT / "state"]
+    has_backup = any(folder.is_dir() and any(folder.glob("*.db*")) for folder in backup_dirs)
+    details["backup_snapshot_found"] = has_backup
+    if not has_backup:
+        details["status"] = "blocked"
+        details["error"] = "no consistent restorable backup snapshot found"
+    if schema_ok and path.is_file():
+        try:
+            conn = _connect_readonly(path)
+        except sqlite3.Error:
+            details["status"] = "failed"
+            details["error"] = "database unreadable"
+            return details
+        try:
+            check = conn.execute("PRAGMA integrity_check").fetchone()[0]
+            details["sqlite_integrity"] = check
+            if check != "ok":
+                details["status"] = "failed"
+                details["error"] = "database corruption"
+        finally:
+            conn.close()
+    return details
+
+
+def _ledger_report(ledger_path: Path) -> dict[str, Any]:
+    try:
+        rows = load_status_snapshot(ledger_path)
+    except Exception as exc:
+        return {"status": "failed", "error": type(exc).__name__}
+    exercise = exercise_ledger(rows)
+    return {
+        "status": "ok",
+        "total_gates": len(rows),
+        "verified": sum(1 for row in rows if row.get("status") in VERIFIED_STATUSES),
+        "blocked": sum(1 for row in rows if row.get("status") == "blocked"),
+        "implemented": sum(1 for row in rows if row.get("status") == "implemented"),
+        "exercise": {key: len(value) for key, value in exercise.items()},
+        "goal_gate_ids": [],
+    }
+
+
+def _overall_status(diag: dict[str, Any], schema_code: str | None) -> str:
+    if schema_code:
+        return "refused"
+    statuses = [item.get("status") for item in diag.values() if isinstance(item, dict)]
+    if any(status == "failed" for status in statuses):
+        return "failed"
+    if any(status == "blocked" for status in statuses):
+        return "blocked"
+    if any(status == "refused" for status in statuses):
+        return "refused"
+    if statuses and all(status in _HEALTHY_DIAGNOSTIC for status in statuses):
+        return "ok"
+    return "blocked"
+
+
+def _refused_section(schema: dict[str, Any]) -> dict[str, Any]:
+    return {"status": "refused", "code": schema.get("code"), "error": schema.get("message")}
+
+
 def run_diagnostics(
     db_path: Path | None = None,
     wiki_dir: Path | None = None,
     live: bool = False,
     ledger_path: Path | None = None,
     quiet: bool = False,
+    cfg: Any | None = None,
+    policy_path: Path | None = None,
 ) -> dict[str, Any]:
-    """Execute topic, extraction, digest, retention, access, and status diagnostics.
+    """Report schema, roles, usage, and retained controls without creating or migrating.
 
-    Returns machine-readable results. Nonzero exit if any subsystem is blocked/failed.
+    A missing or older schema is a visible refusal. Role availability comes from the
+    current extract, review, plan, and private engines. Estimated usage is not a hard cap.
     """
+    del quiet, wiki_dir
     p_db = db_path or DB_PATH
-    l_path = ledger_path or LEDGER_PATH
-
-    diag: dict[str, Any] = {}
-
-    # 1. Topic Diagnostic
-    topic_status = "ok"
-    topic_details: dict[str, Any] = {}
-    if not p_db.exists():
-        topic_status = "blocked"
-        topic_details["error"] = "database not found"
-    else:
-        conn = sqlite3.connect(p_db)
-        try:
-            has_topics = bool(
-                conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='topics'").fetchone()
-            )
-            has_fts = bool(
-                conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='topics_fts'").fetchone()
-            )
-            topic_cnt = conn.execute("SELECT count(*) FROM topics").fetchone()[0] if has_topics else 0
-            fts_cnt = conn.execute("SELECT count(*) FROM topics_fts").fetchone()[0] if has_fts else 0
-            topic_details = {"topics": topic_cnt, "topics_fts": fts_cnt}
-            if not has_topics or not has_fts:
-                topic_status = "blocked"
-                topic_details["error"] = "missing topics or topics_fts table"
-        finally:
-            conn.close()
-    diag["topic"] = {"status": topic_status, **topic_details}
-
-    # 2. Extraction Diagnostic
-    ext_status = "ok"
-    ext_details: dict[str, Any] = {}
-    if not p_db.exists():
-        ext_status = "blocked"
-        ext_details["error"] = "database not found"
-    else:
-        conn = sqlite3.connect(p_db)
-        try:
-            has_ent = bool(
-                conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='entities'").fetchone()
-            )
-            has_claims = bool(
-                conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='claims'").fetchone()
-            )
-            ent_cnt = conn.execute("SELECT count(*) FROM entities").fetchone()[0] if has_ent else 0
-            claims_cnt = conn.execute("SELECT count(*) FROM claims").fetchone()[0] if has_claims else 0
-            ext_details = {"entities": ent_cnt, "claims": claims_cnt}
-            if not has_ent or not has_claims:
-                ext_status = "blocked"
-                ext_details["error"] = "missing entities or claims table"
-        finally:
-            conn.close()
-    diag["extraction"] = {"status": ext_status, **ext_details}
-
-    # 3. Digest Diagnostic
-    dig_status = "ok"
-    dig_details: dict[str, Any] = {}
-    if not p_db.exists():
-        dig_status = "blocked"
-        dig_details["error"] = "database not found"
-    else:
-        conn = sqlite3.connect(p_db)
-        try:
-            has_di = bool(
-                conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='digest_items'").fetchone()
-            )
-            di_cnt = conn.execute("SELECT count(*) FROM digest_items").fetchone()[0] if has_di else 0
-            has_ent = bool(
-                conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='entities'").fetchone()
-            )
-            premature_cnt = (
-                conn.execute(
-                    "SELECT count(*) FROM entities WHERE reported_at IS NOT NULL AND key NOT IN (SELECT ref_id FROM digest_items WHERE message_id IS NOT NULL)"
-                ).fetchone()[0]
-                if has_ent and has_di
-                else 0
-            )
-            dig_details = {"digest_items": di_cnt, "premature_acknowledgements": premature_cnt}
-            if premature_cnt > 0:
-                dig_status = "failed"
-                dig_details["error"] = "premature delivery acknowledgement detected"
-        finally:
-            conn.close()
-    diag["digest"] = {"status": dig_status, **dig_details}
-
-    # 4. Retention Diagnostic
-    ret_status = "ok"
-    ret_details: dict[str, Any] = {}
-    target_dir = p_db.parent if p_db.parent.exists() else ROOT
-    free_bytes = shutil.disk_usage(target_dir).free
-    floor_bytes = 5 * (1024**3)
-    ret_details["free_disk_gb"] = round(free_bytes / (1024**3), 2)
-    ret_details["floor_disk_gb"] = 5.0
-    if free_bytes < floor_bytes:
-        ret_status = "blocked"
-        ret_details["error"] = f"free disk space {ret_details['free_disk_gb']}GB below 5GB floor"
-
-    # Check for actual restorable backup snapshot
-    backup_dirs = [ROOT / "data" / "backups", ROOT / "state"]
-    has_backup = any(b_dir.is_dir() and any(b_dir.glob("*.db*")) for b_dir in backup_dirs)
-    ret_details["backup_snapshot_found"] = has_backup
-    if not has_backup:
-        ret_status = "blocked"
-        ret_details["error"] = "no consistent restorable backup snapshot found"
-
-    if p_db.exists():
-        conn = sqlite3.connect(p_db)
-        try:
-            check = conn.execute("PRAGMA integrity_check").fetchone()[0]
-            ret_details["sqlite_integrity"] = check
-            if check != "ok":
-                ret_status = "failed"
-                ret_details["error"] = f"database corruption: {check}"
-        finally:
-            conn.close()
-    diag["retention"] = {"status": ret_status, **ret_details}
-
-    # 5. Access Diagnostic
-    acc_status = "ok"
-    acc_details: dict[str, Any] = {"live_checked": live}
-    orch = _sibling("orchestrator")
-    if orch and hasattr(orch, "resolve_and_pin"):
-        try:
-            orch.resolve_and_pin("127.0.0.1", 443)
-            acc_status = "failed"
-            acc_details["error"] = "SSRF guard failed to block loopback"
-        except Exception:
-            acc_details["ssrf_guard"] = "enforcing"
-
-    if live:
-        cfg = orch.load_config() if orch and hasattr(orch, "load_config") else None
-        if orch and hasattr(orch, "diagnose_providers") and cfg:
-            prov_diag = orch.diagnose_providers(cfg, live=True)
-            acc_details["provider_diagnostics"] = prov_diag
-            if prov_diag.get("status") != "ok":
-                acc_status = "blocked"
-                acc_details["error"] = prov_diag.get("error") or "provider diagnostics failed"
-        else:
-            acc_status = "blocked"
-            acc_details["error"] = "diagnose_providers API not available in orchestrator"
-    else:
-        acc_details["mode"] = "offline_policy_verified"
-
-    diag["access"] = {"status": acc_status, **acc_details}
-
-    # 6. Status Snapshot Diagnostic
-    stat_status = "ok"
-    stat_details: dict[str, Any] = {}
-    try:
-        rows = load_status_snapshot(l_path)
-        verified = sum(1 for r in rows if r.get("status") in VERIFIED_STATUSES)
-        blocked = sum(1 for r in rows if r.get("status") == "blocked")
-        implemented = sum(1 for r in rows if r.get("status") == "implemented")
-        stat_details = {
-            "total_gates": len(rows),
-            "verified": verified,
-            "blocked": blocked,
-            "implemented": implemented,
-        }
-    except Exception as exc:
-        stat_status = "failed"
-        stat_details["error"] = str(exc)
-    diag["status"] = {"status": stat_status, **stat_details}
-
-    all_ok = all(s.get("status") == "ok" for s in diag.values())
-    has_failed = any(s.get("status") == "failed" for s in diag.values())
-    overall_status = "ok" if all_ok else ("failed" if has_failed else "blocked")
-
-    return {
-        "status": overall_status,
-        "diagnostics": diag,
+    schema = inspect_database(p_db)
+    diag: dict[str, Any] = {
+        "schema": schema,
+        "roles": role_report(_diagnostic_cfg(cfg, live), live=live),
+        "access": _access_report(live, policy_path),
+        "retention": _retention_report(p_db, schema.get("code") is None),
+        "status": _ledger_report(ledger_path or LEDGER_PATH),
     }
+    if schema.get("code"):
+        for name in ("topic", "extraction", "digest", "fields", "usage"):
+            diag[name] = _refused_section(schema)
+    else:
+        try:
+            conn = _connect_readonly(p_db)
+        except sqlite3.Error:
+            unread = {
+                "status": "refused",
+                "code": "database_unreadable",
+                "error": "Database is not readable. Diagnostics did not create or migrate it.",
+            }
+            for name in ("topic", "extraction", "digest", "fields", "usage"):
+                diag[name] = dict(unread)
+        else:
+            try:
+                diag["topic"] = _topic_report(conn)
+                diag["extraction"] = _extraction_report(conn)
+                diag["digest"] = _digest_report(conn)
+                diag["fields"] = _field_report(conn)
+                diag["usage"] = _usage_report(conn)
+            finally:
+                conn.close()
+    roles = diag.get("roles")
+    hard_cap = bool(isinstance(roles, dict) and roles.get("hard_provider_cap"))
+    return _scrub(
+        {
+            "status": _overall_status(diag, schema.get("code")),
+            "code": schema.get("code"),
+            "created": False,
+            "migrated": False,
+            "hard_provider_cap": hard_cap,
+            "diagnostics": diag,
+        }
+    )
 
 
 def main() -> None:
@@ -1454,9 +2543,25 @@ def main() -> None:
         if args.json:
             print(json.dumps(res, indent=2))
         else:
-            print(f"Snowball Diagnostics Status: [{res['status'].upper()}]")
+            code = res.get("code") or ""
+            schema = res["diagnostics"].get("schema") if isinstance(res.get("diagnostics"), dict) else {}
+            message = schema.get("message") if isinstance(schema, dict) else ""
+            print(f"Snowball Diagnostics Status: [{res['status'].upper()}] {code} {message}".rstrip())
             for name, sub_d in res["diagnostics"].items():
-                print(f"  • {name:<12}: [{sub_d.get('status', 'unknown').upper()}] {sub_d}")
+                if not isinstance(sub_d, dict):
+                    continue
+                extra = sub_d.get("message") or sub_d.get("error") or ""
+                print(f"  • {name:<12}: [{str(sub_d.get('status', 'unknown')).upper()}] {extra}".rstrip())
+            roles = res["diagnostics"].get("roles")
+            if isinstance(roles, dict):
+                for role_name in ("extract", "review", "plan", "private_eval"):
+                    role = roles.get(role_name)
+                    if isinstance(role, dict):
+                        print(
+                            f"    {role_name}: available={role.get('available')} "
+                            f"usage={role.get('usage_mode')} hard_cap={role.get('hard_provider_cap')} "
+                            f"reason={role.get('reason')}"
+                        )
         sys.exit(0 if res["status"] == "ok" else 1)
     elif args.cmd == "evidence-check":
         try:
@@ -1467,6 +2572,8 @@ def main() -> None:
         verified = sum(1 for row in rows if row["status"] in VERIFIED_STATUSES)
         implemented = sum(1 for row in rows if row["status"] == "implemented")
         blocked = sum(1 for row in rows if row["status"] == "blocked")
+        exercise = exercise_ledger(rows)
+        exercise_counts = {key: len(value) for key, value in exercise.items()}
         if args.json:
             print(
                 json.dumps(
@@ -1475,6 +2582,8 @@ def main() -> None:
                         "verified": verified,
                         "implemented": implemented,
                         "blocked": blocked,
+                        "exercise": exercise_counts,
+                        "goal_gate_ids": [],
                         "rows": rows,
                     },
                     indent=2,
@@ -1483,7 +2592,9 @@ def main() -> None:
         else:
             print(
                 f"status snapshot: {len(rows)} gates; verified {verified}; "
-                f"implemented {implemented}; blocked {blocked}. "
+                f"implemented {implemented}; blocked {blocked}; "
+                f"pass {exercise_counts['pass']}; fail {exercise_counts['fail']}; "
+                f"unexercised {exercise_counts['unexercised']}. "
                 "Verified means a row already carries evidence. This command does not run gates."
             )
         sys.exit(0)

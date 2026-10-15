@@ -1,7 +1,6 @@
 [Unit]
-Description=Snowball transactional research supervisor (touch STOP to pause)
-After=network-online.target snowball-tunnels.service
-Wants=snowball-tunnels.service
+Description=Snowball generic research supervisor (already-started goals only)
+After=network-online.target
 
 [Service]
 Type=simple
@@ -10,8 +9,8 @@ Group=ubuntu
 WorkingDirectory=/home/ubuntu/repos/snowball
 Environment=PATH=/home/ubuntu/repos/snowball/.venv/bin:/home/ubuntu/.bun/bin:/usr/local/bin:/usr/bin:/bin:/home/ubuntu/.local/bin
 EnvironmentFile=-/home/ubuntu/.config/snowball/environment
-ExecStart=/home/ubuntu/repos/snowball/.venv/bin/python /home/ubuntu/repos/snowball/snowball.py supervise --max-topics 1 --json
-Restart=always
+ExecStart=/home/ubuntu/repos/snowball/.venv/bin/python /home/ubuntu/repos/snowball/snowball.py goal --db /home/ubuntu/repos/snowball/data/snowball.db supervise --max-waves 5
+Restart=on-failure
 RestartSec=60
 MemoryMax=3G
 MemorySwapMax=0

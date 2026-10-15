@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -359,6 +360,62 @@ class ProcessControlTests(unittest.TestCase):
         self.assertIn("EARLY", path.read_text(encoding="utf-8"))
         self.assertIsNotNone(rc)
         self.assertTrue(wait_dead(labeled_pid(text, "PID")))
+
+    def test_supervisor_stop_exits_without_killing_unrelated_processes(self):
+        """A pre-existing STOP ends an empty schema-4 supervisor and leaves other processes alone."""
+        personal = ROOT / "data" / "snowball.db"
+        personal_existed = personal.exists()
+        personal_stamp = personal.stat().st_mtime_ns if personal_existed else None
+        repo_stop = ROOT / "STOP"
+        repo_stop_existed = repo_stop.exists()
+        runtime = import_tool("snowball_goal_runtime", "tools/goal_runtime.py")
+        orch = runtime._sibling("orchestrator")
+        db_path = self._log("empty.db")
+        store = orch.Store.open(db_path)
+        store.db.close()
+        stop = self._log("STOP")
+        stop.write_text("stop\n", encoding="utf-8")
+        script = self._log("supervise_once.py")
+        script.write_text(
+            "import importlib.util, sys\n"
+            "from pathlib import Path\n"
+            "root = Path(sys.argv[1])\n"
+            "db_path, stop_path = sys.argv[2], sys.argv[3]\n"
+            "runtime_path = root / 'tools' / 'goal_runtime.py'\n"
+            "spec = importlib.util.spec_from_file_location('snowball_goal_runtime', runtime_path)\n"
+            "module = importlib.util.module_from_spec(spec)\n"
+            "sys.modules['snowball_goal_runtime'] = module\n"
+            "spec.loader.exec_module(module)\n"
+            "orchestrator = module._sibling('orchestrator')\n"
+            "code = module.supervise(orchestrator.Config(), None, False, db_path=db_path, stop_file=stop_path, max_topics=1)\n"
+            "print('SUPERVISE_RC=' + str(code), flush=True)\n",
+            encoding="utf-8",
+        )
+        unrelated = self._spawn_sleeper()
+        log_path = self._log("supervise.log")
+        code, text = pc.run_owned_process_tree(
+            [sys.executable, "-u", str(script), str(ROOT), str(db_path), str(stop)],
+            cwd=str(ROOT),
+            stdout_path=log_path,
+            timeout=180,
+        )
+        self.assertEqual(code, 0, text)
+        self.assertIn("SUPERVISE_RC=0", text)
+        self.assertTrue(pid_alive(unrelated.pid))
+        self.assertIsNone(unrelated.poll())
+        conn = sqlite3.connect(db_path)
+        try:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM goals").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM fetches").fetchone()[0], 0)
+            version = conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0]
+            self.assertEqual(str(version), "4")
+        finally:
+            conn.close()
+        self.assertEqual(repo_stop.exists(), repo_stop_existed)
+        if personal_existed:
+            self.assertEqual(personal.stat().st_mtime_ns, personal_stamp)
+        else:
+            self.assertFalse(personal.exists())
 
 
 if __name__ == "__main__":

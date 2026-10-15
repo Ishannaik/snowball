@@ -13,6 +13,7 @@ import contextlib
 import datetime as dt
 import importlib.util
 import json
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -103,8 +104,8 @@ class TestBehaviorRegressions(unittest.TestCase):
         self.assertEqual(k1, "mozilla-technology-fund|mozilla-foundation|2026")
         self.assertEqual(k2, "mozilla-technology-fund|mozilla-foundation|2026")
 
-    def test_grok_snowflake_timestamp_validation(self):
-        """snowflake_utc decodes a known id into year 2024."""
+    def test_status_id_timestamp_decodes_year(self):
+        """snowflake_utc decodes a known status id into year 2024."""
         dt_tweet = orch.snowflake_utc("1800000000000000000")
         self.assertIsNotNone(dt_tweet)
         self.assertEqual(dt_tweet.year, 2024)
@@ -306,6 +307,552 @@ class TestBehaviorRegressions(unittest.TestCase):
         self.assertIn("retention", d_res["diagnostics"])
         self.assertIn("access", d_res["diagnostics"])
         self.assertIn("status", d_res["diagnostics"])
+        self.assertIn("schema", d_res["diagnostics"])
+        self.assertIn("roles", d_res["diagnostics"])
+        self.assertIn("usage", d_res["diagnostics"])
+        self.assertIn("fields", d_res["diagnostics"])
+        self.assertFalse(d_res["created"])
+        self.assertFalse(d_res["migrated"])
+        self.assertFalse(d_res["hard_provider_cap"])
+
+    def test_missing_and_old_schema_are_refused_without_create_or_migrate(self):
+        """A missing or older database is a visible refusal and is left untouched."""
+        missing = Path(self.td.name) / "missing.db"
+        refused = eval_mod.run_diagnostics(db_path=missing, live=False, quiet=True)
+        self.assertFalse(missing.exists())
+        self.assertEqual(refused["status"], "refused")
+        self.assertEqual(refused["code"], "database_missing")
+        self.assertFalse(refused["created"])
+        self.assertFalse(refused["migrated"])
+        self.assertIn("does not exist", refused["diagnostics"]["schema"]["message"])
+
+        old = Path(self.td.name) / "old.db"
+        conn = sqlite3.connect(old)
+        conn.execute("CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute("INSERT INTO schema_meta VALUES ('schema_version', '2')")
+        conn.commit()
+        conn.close()
+        before_size = old.stat().st_size
+        old_report = eval_mod.run_diagnostics(db_path=old, live=False, quiet=True)
+        self.assertEqual(old.stat().st_size, before_size)
+        self.assertEqual(old_report["status"], "refused")
+        self.assertEqual(old_report["code"], "migration_required")
+        self.assertEqual(old_report["diagnostics"]["schema"]["observed_version"], 2)
+        self.assertFalse(old_report["created"])
+        self.assertFalse(old_report["migrated"])
+        check = sqlite3.connect(old.resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            tables = {row[0] for row in check.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            version = check.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0]
+        finally:
+            check.close()
+        self.assertEqual(version, "2")
+        self.assertNotIn("goals", tables)
+        self.assertNotIn("model_calls", tables)
+
+        older = Path(self.td.name) / "v3.db"
+        conn = sqlite3.connect(older)
+        conn.execute("CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute("INSERT INTO schema_meta VALUES ('schema_version', '3')")
+        conn.commit()
+        conn.close()
+        before = older.stat().st_size
+        v3_report = eval_mod.run_diagnostics(db_path=older, live=False, quiet=True)
+        self.assertEqual(older.stat().st_size, before)
+        self.assertEqual(v3_report["status"], "refused")
+        self.assertEqual(v3_report["code"], "migration_required")
+        self.assertEqual(v3_report["diagnostics"]["schema"]["observed_version"], 3)
+        self.assertFalse(v3_report["created"])
+        self.assertFalse(v3_report["migrated"])
+        check = sqlite3.connect(older.resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            version = check.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0]
+            tables = {row[0] for row in check.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        finally:
+            check.close()
+        self.assertEqual(version, "3")
+        self.assertNotIn("goals", tables)
+
+    def test_diagnostics_separate_usage_and_hide_private_values(self):
+        """Actual, estimated, and legacy usage stay distinct. Private values and credentials are omitted."""
+        db = self.store.db
+        db.execute("INSERT INTO domains(domain) VALUES ('example.test')")
+        db.execute(
+            """
+            INSERT INTO pages (
+              canon_url, domain, status, next_check_at, interval_sec, discovered_via, created_at
+            ) VALUES ('https://example.test/tuition', 'example.test', 'fetched', 0, 86400, 'seed', 1)
+            """
+        )
+        db.execute(
+            """
+            INSERT INTO source_snapshots (
+              page_id, content_hash, retrieved_at, text_path, visibility, provenance
+            ) VALUES (1, 'abc', 1, 'synthetic.txt', 'public', 'public_fetch')
+            """
+        )
+        db.execute(
+            """
+            INSERT INTO observations (
+              snapshot_id, page_id, field_key, value_json, subject_json, quote, quote_start, quote_end,
+              extractor_model, prompt_version, assurance, created_at
+            ) VALUES (
+              1, 1, 'tuition', '{"amount":0}', '{}', 'Tuition is 0', 0, 12,
+              'fixture', 'v1', 'code_checked', 1
+            )
+            """
+        )
+        db.execute(
+            """
+            INSERT INTO goals (slug, title, state, created_at, updated_at)
+            VALUES ('synthetic-goal', 'Synthetic', 'draft', 1, 1)
+            """
+        )
+        db.execute(
+            """
+            INSERT INTO profile_fields (
+              goal_id, key, value_json, status, provenance, visibility, updated_at
+            ) VALUES (
+              1, 'max_upfront_cash', '{"amount":0,"currency":"ZZZSECRET"}',
+              'known', 'user_confirmed', 'private', 1
+            )
+            """
+        )
+        db.execute(
+            """
+            INSERT INTO profile_fields (
+              goal_id, key, value_json, status, provenance, visibility, updated_at
+            ) VALUES (1, 'degree_level', '"masters"', 'known', 'user_confirmed', 'public_ok', 1)
+            """
+        )
+        db.execute(
+            """
+            INSERT INTO model_calls (
+              role, requested_model, reported_model, transport, source_snapshot_ids_json,
+              tokens_in, tokens_out, thinking_tokens, usage_kind, state, started_at
+            ) VALUES (
+              'extract', 'public-extract', 'public-extract', 'gemini', '[]',
+              11, 3, 2, 'actual', 'complete', 1
+            )
+            """
+        )
+        db.execute(
+            """
+            INSERT INTO model_calls (
+              role, requested_model, transport, source_snapshot_ids_json,
+              tokens_in, tokens_out, usage_kind, state, started_at
+            ) VALUES ('review', 'public-review', 'agy', '[]', 5, 1, 'estimated', 'complete', 2)
+            """
+        )
+        db.execute(
+            """
+            INSERT INTO model_calls (
+              role, requested_model, transport, source_snapshot_ids_json,
+              tokens_in, tokens_out, usage_kind, state, started_at
+            ) VALUES ('review', 'historical-model', 'legacy', '[]', 9, 4, 'legacy', 'complete', 3)
+            """
+        )
+        db.execute(
+            """
+            INSERT INTO model_calls (
+              role, requested_model, reported_model, transport, source_snapshot_ids_json,
+              tokens_in, tokens_out, usage_kind, state, started_at
+            ) VALUES (
+              'review', 'xai-oauth/grok-4.7', 'agy-pool/claude-sonnet-4-6', 'grok', '[]',
+              7, 1, 'actual', 'complete', 4
+            )
+            """
+        )
+        db.execute(
+            """
+            INSERT INTO engine_spend (day, engine, calls, tokens_in, tokens_out)
+            VALUES ('2026-10-01', 'grok', 4, 100, 20)
+            """
+        )
+        cfg = type(
+            "Cfg",
+            (),
+            {
+                "gemini_api_key": "sk-supersecretvalue",
+                "private_model_endpoint": "http://user:super-secret-token@127.0.0.1:9/v1",
+                "private_model_attested": False,
+            },
+        )()
+        report = eval_mod.run_diagnostics(db_path=self.db_path, live=False, quiet=True, cfg=cfg)
+        blob = json.dumps(report)
+        self.assertNotIn("ZZZSECRET", blob)
+        self.assertNotIn("super-secret-token", blob)
+        self.assertNotIn("sk-supersecretvalue", blob)
+        self.assertIn("xai-oauth/grok-4.7", blob)
+        self.assertNotIn("agy-pool/claude-sonnet-4-6", blob)
+        self.assertFalse(report["hard_provider_cap"])
+        usage = report["diagnostics"]["usage"]
+        self.assertEqual(usage["calls"]["actual"], 1)
+        self.assertEqual(usage["calls"]["estimated"], 1)
+        self.assertEqual(usage["calls"]["legacy"], 1)
+        self.assertEqual(usage["calls"]["unknown"], 1)
+        self.assertEqual(usage["by_role"]["extract"]["actual"]["tokens_in"], 11)
+        self.assertEqual(usage["by_role"]["extract"]["actual"]["thinking_tokens"], 2)
+        self.assertEqual(usage["by_role"]["review"]["estimated"]["tokens_in"], 5)
+        self.assertEqual(usage["by_role"]["review"]["legacy"]["tokens_in"], 9)
+        self.assertEqual(usage["legacy_aggregate_tokens_in"], 100)
+        self.assertFalse(usage["hard_provider_cap"])
+        self.assertEqual(
+            usage["legacy_engines"],
+            [
+                {
+                    "engine": "grok",
+                    "attribution": "legacy",
+                    "usage_kind": "unknown",
+                    "calls": 4,
+                    "tokens_in": 100,
+                    "tokens_out": 20,
+                }
+            ],
+        )
+        identities = {
+            (row["transport"], row["requested_model"], row["reported_model"], row["usage_kind"]): row
+            for row in usage["identities"]
+        }
+        self.assertEqual(identities[("grok", "xai-oauth/grok-4.7", "", "unknown")]["tokens_in"], 7)
+        self.assertEqual(identities[("legacy", "historical-model", "", "legacy")]["tokens_in"], 9)
+        self.assertNotIn("claude", json.dumps(usage["legacy_engines"]).lower())
+        fields = report["diagnostics"]["fields"]
+        self.assertIn("degree_level", fields["public_field_keys"])
+        self.assertNotIn("max_upfront_cash", fields["public_field_keys"])
+        self.assertEqual(fields["private_profile_fields"], 1)
+        self.assertEqual(fields["observations"][0]["field_key"], "tuition")
+        self.assertEqual(fields["sources"][0]["provenance"], "public_fetch")
+        private = report["diagnostics"]["roles"]["private_eval"]
+        self.assertFalse(private["available"])
+        self.assertFalse(private["attested_local"])
+        self.assertEqual(private["reason"], "local_model_required")
+        self.assertNotIn("private_model_endpoint", private)
+
+    def test_estimated_and_loopback_roles_cannot_claim_a_hard_cap_or_local_inference(self):
+        """Role normalization keeps estimated usage and loopback endpoints unattested."""
+        estimated = eval_mod._normalize_role(
+            "review",
+            "ReviewEngine",
+            {
+                "configured": True,
+                "available": True,
+                "reason": "ready",
+                "model_id": "claude-sonnet-4-6",
+                "transport": "agy",
+                "usage_mode": "estimated",
+                "hard_provider_cap": True,
+                "conformance_attested": True,
+            },
+        )
+        self.assertEqual(estimated["usage_mode"], "estimated")
+        self.assertFalse(estimated["hard_provider_cap"])
+        self.assertFalse(estimated["conformance_attested"])
+
+        loopback = eval_mod._normalize_role(
+            "private_eval",
+            "LocalPrivateEngine",
+            {
+                "configured": True,
+                "available": True,
+                "reason": "loopback",
+                "model_id": "local-private",
+                "transport": "local",
+                "usage_mode": "actual",
+                "attested_local": True,
+                "isolation_documented": True,
+                "endpoint_host_class": "loopback",
+                "hard_provider_cap": True,
+                "endpoint": "http://user:super-secret-token@127.0.0.1:9/v1",
+            },
+        )
+        self.assertFalse(loopback["available"])
+        self.assertFalse(loopback["attested_local"])
+        self.assertEqual(loopback["reason"], "local_model_required")
+        self.assertFalse(loopback["hard_provider_cap"])
+        self.assertNotIn("endpoint", loopback)
+        self.assertNotIn("super-secret-token", json.dumps(loopback))
+
+        attested = eval_mod._normalize_role(
+            "private_eval",
+            "LocalPrivateEngine",
+            {
+                "configured": True,
+                "available": True,
+                "model_id": "local-private",
+                "transport": "local",
+                "usage_mode": "actual",
+                "attested_local": True,
+                "isolation_documented": True,
+                "endpoint_host_class": "private",
+                "conformance_attested": True,
+                "hard_provider_cap": True,
+            },
+        )
+        self.assertTrue(attested["available"])
+        self.assertTrue(attested["attested_local"])
+        self.assertEqual(attested["reason"], "attested")
+        self.assertFalse(attested["hard_provider_cap"])
+
+        legacy = eval_mod._normalize_role(
+            "review",
+            "ReviewEngine",
+            {
+                "available": True,
+                "configured": True,
+                "model_id": "xai-oauth/grok-4.7",
+                "reason": "verifier ready",
+            },
+        )
+        self.assertEqual(legacy["model_id"], "xai-oauth/grok-4.7")
+        self.assertTrue(legacy["available"])
+        self.assertEqual(legacy["reason"], "verifier ready")
+        self.assertIn("grok", json.dumps(legacy).lower())
+
+        named = eval_mod._normalize_role(
+            "extract",
+            "GeminiBulkExtractor",
+            {
+                "available": True,
+                "configured": True,
+                "model_id": "openrouter/ornith-india",
+                "transport": "openrouter",
+                "usage_mode": "estimated",
+                "reason": "ornith route kept",
+                "hard_provider_cap": True,
+                "conformance_attested": True,
+            },
+        )
+        self.assertEqual(named["model_id"], "openrouter/ornith-india")
+        self.assertEqual(named["transport"], "openrouter")
+        self.assertIn("ornith", named["reason"])
+        self.assertFalse(named["hard_provider_cap"])
+        self.assertFalse(named["conformance_attested"])
+
+        counted = eval_mod._normalize_role(
+            "extract",
+            "GeminiBulkExtractor",
+            {
+                "available": True,
+                "configured": True,
+                "model": "gemini-3.8-flash",
+                "transport": "gemini",
+                "usage_kind": "provider_reported",
+                "hard_cap": "unavailable",
+                "conformance": "unattested",
+                "billing_ceiling": True,
+                "candidates": 4,
+            },
+        )
+        self.assertEqual(counted["usage_mode"], "actual")
+        self.assertEqual(counted["model_id"], "gemini-3.8-flash")
+        self.assertFalse(counted["hard_provider_cap"])
+        self.assertFalse(counted["conformance_attested"])
+        self.assertNotIn("candidates", counted)
+        self.assertNotIn("billing_ceiling", counted)
+
+        attested_agy = eval_mod._normalize_role(
+            "review",
+            "ReviewEngine",
+            {
+                "available": True,
+                "configured": True,
+                "model": "agy-pool/claude-sonnet-4-6",
+                "transport": "agy",
+                "usage_kind": "estimated",
+                "hard_cap": "attested",
+                "conformance": "attested",
+                "billing_ceiling": True,
+                "endpoint_host": "127.0.0.1",
+                "endpoint_port": 8088,
+            },
+        )
+        self.assertEqual(attested_agy["usage_mode"], "estimated")
+        self.assertTrue(attested_agy["hard_provider_cap"])
+        self.assertTrue(attested_agy["conformance_attested"])
+        self.assertEqual(attested_agy["model_id"], "agy-pool/claude-sonnet-4-6")
+        self.assertNotIn("127.0.0.1", json.dumps(attested_agy))
+        self.assertNotIn("8088", json.dumps(attested_agy))
+
+    def test_role_report_uses_live_engine_contracts_without_dispatch(self):
+        """Availability comes from the current engines and never sends a model call."""
+        transport = eval_mod._try_module("engine_transport")
+        self.assertIsNotNone(transport)
+        dispatched = []
+
+        def trap(name):
+            def _blocked(*_args, **_kwargs):
+                dispatched.append(name)
+                raise AssertionError(name)
+            return _blocked
+
+        originals = {}
+        for cls_name, method in (
+            ("GeminiBulkExtractor", "extract"),
+            ("ReviewEngine", "review"),
+            ("ReviewEngine", "plan"),
+            ("LocalPrivateEngine", "private_eval"),
+        ):
+            cls = getattr(transport, cls_name)
+            originals[(cls_name, method)] = getattr(cls, method)
+            setattr(cls, method, trap(method))
+        runtime = eval_mod._try_module("goal_runtime")
+        original_supervise = getattr(runtime, "supervise", None) if runtime is not None else None
+        if runtime is not None:
+            def _no_supervise(*_args, **_kwargs):
+                raise AssertionError("supervise")
+            runtime.supervise = _no_supervise
+        try:
+            omp = type("Cfg", (), {"gemini_transport": "omp", "gemini_model": "gemini-3.8-flash"})()
+            omp_roles = eval_mod.role_report(omp, live=False)
+            self.assertEqual(omp_roles["network_check"], "unexercised")
+            self.assertEqual(omp_roles["extract"]["engine"], "GeminiBulkExtractor")
+            self.assertEqual(omp_roles["extract"]["usage_mode"], "estimated")
+            self.assertTrue(omp_roles["extract"]["available"])
+            self.assertFalse(omp_roles["extract"]["hard_provider_cap"])
+            self.assertEqual(omp_roles["review"]["engine"], "ReviewEngine")
+            self.assertEqual(omp_roles["plan"]["engine"], "ReviewEngine")
+            self.assertEqual(omp_roles["review"]["reason"], "not_configured")
+            self.assertEqual(omp_roles["plan"]["reason"], "not_configured")
+            self.assertFalse(omp_roles["review"]["available"])
+            self.assertFalse(omp_roles["plan"]["available"])
+            self.assertEqual(omp_roles["review"]["model_id"], "")
+            self.assertEqual(omp_roles["review"]["requested_model"], "")
+            self.assertNotIn("claude", json.dumps(omp_roles["review"]).lower())
+            self.assertNotIn("claude", json.dumps(omp_roles["plan"]).lower())
+            self.assertFalse(omp_roles["hard_provider_cap"])
+
+            bounded = type(
+                "Cfg",
+                (),
+                {
+                    "review_model": "agy-pool/claude-sonnet-4-6",
+                    "agy_base_url": "http://127.0.0.1:8088/v1",
+                    "adapter_conformance": {
+                        "adapter": "openai_compatible",
+                        "evidence": "operator-evidence-abcdef123456",
+                        "base_url": "http://127.0.0.1:8088/v1",
+                        "hard_provider_bound": True,
+                    },
+                },
+            )()
+            bounded_roles = eval_mod.role_report(bounded, live=False)
+            review_diag = dict(transport.ReviewEngine(bounded, dry=True).diagnostics())
+            self.assertEqual(review_diag["usage_kind"], "estimated")
+            self.assertEqual(review_diag["hard_cap"], "attested")
+            self.assertEqual(review_diag["conformance"], "attested")
+            self.assertEqual(bounded_roles["review"]["usage_mode"], "estimated")
+            self.assertEqual(bounded_roles["review"]["requested_model"], "agy-pool/claude-sonnet-4-6")
+            self.assertEqual(bounded_roles["review"]["reported_model"], review_diag["model"])
+            self.assertTrue(bounded_roles["review"]["hard_provider_cap"])
+            self.assertTrue(bounded_roles["review"]["conformance_attested"])
+            self.assertFalse(bounded_roles["hard_provider_cap"])
+            self.assertEqual(bounded_roles["plan"]["reason"], "not_configured")
+            self.assertFalse(bounded_roles["plan"]["hard_provider_cap"])
+            self.assertNotIn("8088", json.dumps(bounded_roles))
+            self.assertNotIn("127.0.0.1", json.dumps(bounded_roles))
+
+            loopback = type(
+                "Cfg",
+                (),
+                {
+                    "private_model_endpoint": "http://127.0.0.1:11434/v1",
+                    "private_model_id": "local-qwen",
+                    "private_model_attested": True,
+                    "private_model_isolation": "serving daemon has no egress and isolation is documented",
+                },
+            )()
+            loop_roles = eval_mod.role_report(loopback, live=False)
+            private_loop = loop_roles["private_eval"]
+            self.assertEqual(private_loop["engine"], "LocalPrivateEngine")
+            self.assertEqual(private_loop["requested_model"], "local-qwen")
+            self.assertEqual(private_loop["reported_model"], "local-qwen")
+            self.assertEqual(private_loop["model_id"], "local-qwen")
+            self.assertFalse(private_loop["available"])
+            self.assertFalse(private_loop["attested_local"])
+            self.assertEqual(private_loop["reason"], "local_model_required")
+            self.assertFalse(private_loop["hard_provider_cap"])
+            self.assertNotIn("endpoint", private_loop)
+            self.assertNotIn("127.0.0.1", json.dumps(private_loop))
+
+            attested = type(
+                "Cfg",
+                (),
+                {
+                    "private_model_endpoint": "http://10.9.8.7:11434/v1",
+                    "private_model_id": "local-qwen",
+                    "private_model_attested": True,
+                    "private_model_isolation": "serving daemon has no egress and isolation is documented",
+                },
+            )()
+            attested_roles = eval_mod.role_report(attested, live=False)
+            private_ok = attested_roles["private_eval"]
+            private_diag = dict(transport.LocalPrivateEngine(attested, dry=True).diagnostics())
+            self.assertTrue(private_diag["available"])
+            self.assertTrue(private_diag["attested_local"])
+            self.assertEqual(private_diag["model"], "local-qwen")
+            self.assertEqual(private_diag["reason"], "dry")
+            self.assertEqual(private_ok["requested_model"], "local-qwen")
+            self.assertEqual(private_ok["reported_model"], "local-qwen")
+            self.assertEqual(private_ok["model_id"], "local-qwen")
+            self.assertTrue(private_ok["available"])
+            self.assertTrue(private_ok["attested_local"])
+            self.assertEqual(private_ok["reason"], private_diag["reason"])
+            self.assertFalse(private_ok["hard_provider_cap"])
+            self.assertNotIn("10.9.8.7", json.dumps(attested_roles))
+            self.assertNotIn("11434", json.dumps(attested_roles))
+
+            leaked = type(
+                "Cfg",
+                (),
+                {
+                    "gemini_api_key": "sk-supersecretvalue",
+                    "review_model": "xai-oauth/grok-4.7",
+                    "private_model_endpoint": "http://user:super-secret-token@10.1.2.3:11434/v1",
+                    "private_model_id": "local-qwen",
+                    "private_model_attested": True,
+                    "private_model_isolation": "serving daemon has no egress and isolation is documented",
+                },
+            )()
+            hidden = eval_mod.role_report(leaked, live=False)
+            blob = json.dumps(hidden).lower()
+            self.assertIn("xai-oauth/grok-4.7", blob)
+            self.assertNotIn("super-secret-token", blob)
+            self.assertNotIn("sk-supersecretvalue", blob)
+            self.assertNotIn("10.1.2.3", blob)
+            self.assertTrue(hidden["review"]["available"])
+            self.assertEqual(hidden["review"]["model_id"], "xai-oauth/grok-4.7")
+            self.assertEqual(hidden["review"]["requested_model"], "xai-oauth/grok-4.7")
+            self.assertEqual(hidden["review"]["usage_mode"], "estimated")
+            self.assertFalse(hidden["review"]["hard_provider_cap"])
+            self.assertFalse(hidden["private_eval"]["available"])
+            self.assertEqual(hidden["private_eval"]["requested_model"], "local-qwen")
+            self.assertEqual(dispatched, [])
+            diag = eval_mod.run_diagnostics(db_path=self.db_path, live=False, quiet=True, cfg=omp)
+            self.assertFalse(diag["created"])
+            self.assertFalse(diag["migrated"])
+            self.assertFalse(diag["hard_provider_cap"])
+        finally:
+            for (cls_name, method), fn in originals.items():
+                setattr(getattr(transport, cls_name), method, fn)
+            if runtime is not None and original_supervise is not None:
+                runtime.supervise = original_supervise
+
+    def test_robots_disallow_and_zero_paid_tariff_stay_enforced(self):
+        """A disallow rule blocks the path, and a zero tariff cannot reserve paid spend."""
+        body = "User-agent: *\nDisallow: /private\n"
+        self.assertFalse(eval_mod.robots_path_allowed(body, "/private"))
+        self.assertTrue(eval_mod.robots_path_allowed(body, "/public"))
+        reason = eval_mod.paid_tariff_block_reason({"tariffs": {"zenrows": 0}}, "zenrows")
+        self.assertTrue(reason.startswith("PaidBudgetExhausted:tariff_disabled"))
+        report = eval_mod.run_diagnostics(db_path=self.db_path, live=False, quiet=True)
+        access = report["diagnostics"]["access"]
+        self.assertEqual(access["ssrf_guard"], "enforcing")
+        self.assertEqual(access["robots"], "enforcing")
+        self.assertEqual(access["paid_ceiling_micro_usd"], 0)
+        self.assertEqual(access["paid_route"], "disabled")
+
+
 class TestGateEvidence(unittest.TestCase):
     def setUp(self):
         self.td = tempfile.TemporaryDirectory(prefix="snowball-gate-evidence-")
@@ -554,6 +1101,40 @@ class TestGateEvidence(unittest.TestCase):
         stored = json.loads(self.ledger.read_text(encoding="utf-8"))
         self.assertEqual(stored["gate_id"], "M2.01")
         self.assertEqual(stored["exit_code"], 0)
+
+    def test_goal_harness_ids_are_not_ledger_gates(self):
+        """G01-G30 stay outside the legacy ledger."""
+        with self.assertRaises(eval_mod.GateEvidenceError):
+            self._record(gate_id="G01", status="blocked", owner="T10", detail="not a legacy gate")
+        self.assertFalse(self.ledger.exists())
+
+    def test_ledger_exercise_matches_recorded_runs(self):
+        """The checked-in ledger has no pass or fail until a real run is recorded."""
+        rows = eval_mod.load_status_snapshot()
+        exercise = eval_mod.exercise_ledger(rows)
+        self.assertEqual(exercise["pass"], [])
+        self.assertEqual(exercise["fail"], [])
+        self.assertEqual(exercise["unexercised"], eval_mod.expected_gate_ids())
+        failed = eval_mod.exercise_ledger(
+            [
+                {
+                    "gate_id": "M1.08",
+                    "status": "blocked",
+                    "finished_at": "2026-10-08T00:00:01Z",
+                    "exit_code": 1,
+                },
+                {
+                    "gate_id": "G08",
+                    "status": "live_verified",
+                    "finished_at": "2026-10-08T00:00:01Z",
+                    "exit_code": 0,
+                    "evidence_path": "x",
+                },
+            ]
+        )
+        self.assertEqual(failed["fail"], ["M1.08"])
+        self.assertEqual(failed["pass"], [])
+        self.assertNotIn("G08", failed["pass"] + failed["fail"] + failed["unexercised"])
 
 
 if __name__ == "__main__":

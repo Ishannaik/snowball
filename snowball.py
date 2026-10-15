@@ -25,12 +25,13 @@ def add_storage(parser: argparse.ArgumentParser, *, wiki: bool = False) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="snowball", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
+    goal_parser = sub.add_parser("goal", help="Generic goal interview, review, approval, grant and bounded run (forwards to generic_cli)")
+    goal_parser.add_argument("arguments", nargs=argparse.REMAINDER)
+    migration_parser = sub.add_parser("migrate", help="Explicit generic schema upgrade with a verified backup bundle (forwards to generic_cli)")
+    migration_parser.add_argument("arguments", nargs=argparse.REMAINDER)
     for name, flag, description in (
-        ("run", None, "Run a research batch"),
         ("run-once", "--run-once", "Run one wave and report its supervisor outcome"),
-        ("supervise", "--supervise", "Run the persistent, STOP-aware supervisor"),
         ("seed", "--seed-only", "Seed the deterministic topic grid"),
-        ("status", "--status", "Read frontier health, spend, and supervisor state"),
     ):
         p = sub.add_parser(name, help=description)
         p.set_defaults(worker="orchestrator.py", worker_flag=flag)
@@ -42,25 +43,27 @@ def build_parser() -> argparse.ArgumentParser:
         if name in ("run", "run-once", "supervise"):
             p.add_argument("--topic", help="Target topic slug")
             p.add_argument("--max-topics", type=int, default=1 if name != "run" else None)
-            p.add_argument("--mode", choices=["auto", "gemini-bulk", "grok-xhigh", "local"], help="Override configured extraction mode")
+            p.add_argument("--mode", choices=["auto", "gemini-bulk"], help="Override configured extraction mode")
 
-    p = sub.add_parser("ask", help="Answer from retrieved local Markdown with citations")
-    p.set_defaults(worker="ask.py", worker_flag=None)
-    p.add_argument("query")
-    add_storage(p, wiki=True)
-    p.add_argument("--json", action="store_true")
-    p.add_argument("--no-model", action="store_true")
-    p.add_argument("--limit", type=int, default=12)
+    ask_parser = sub.add_parser("ask", help="Query kept generic goal evidence (forwards to generic_cli)")
+    ask_parser.add_argument("arguments", nargs=argparse.REMAINDER)
 
-    for name in ("serve", "visualize"):
-        p = sub.add_parser(name, help="View the read-only research dashboard")
-        p.set_defaults(worker="visualize.py", worker_flag="--serve" if name == "serve" else None)
-        add_storage(p)
-        p.add_argument("--port", type=int, default=8989)
-        p.add_argument("--host", default="127.0.0.1", help="Bind address; loopback by default")
-        if name == "visualize":
-            p.add_argument("--serve", action="store_true")
-            p.add_argument("--terminal", action="store_true")
+    p = sub.add_parser("serve", help="Serve the authenticated generic console API")
+    p.set_defaults(worker=None, worker_flag=None)
+    add_storage(p)
+    p.add_argument("--port", type=int, default=None)
+    p.add_argument("--origin", default=None, help="Expected Origin for authenticated writes (default loopback http origin)")
+    p.add_argument("--token", default=None, help="Bootstrap API token; random one printed once when omitted")
+
+    console_parser = sub.add_parser("console", help="Generic console controls; forwards to the generic CLI (server: snowball serve)")
+    console_parser.add_argument("arguments", nargs=argparse.REMAINDER)
+
+    p = sub.add_parser("visualize", help="Render a terminal view of the research database")
+    p.set_defaults(worker="visualize.py", worker_flag=None)
+    add_storage(p)
+    p.add_argument("--port", type=int, default=8989)
+    p.add_argument("--host", default="127.0.0.1", help="Bind address; loopback by default")
+    p.add_argument("--terminal", action="store_true")
 
     for name in ("digest", "alerts"):
         p = sub.add_parser(name, help="Prepare evidence-backed delivery; acknowledge only confirmed sends")
@@ -125,16 +128,24 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    supplied = list(sys.argv[1:] if argv is None else argv)
+    if supplied and supplied[0] in ("goal", "console", "run", "migrate", "serve", "status", "supervise", "retention", "ask"):
+        # Generic cutover: the default active surface is the generic harness.
+        # `goal`/`console` forward to the generic CLI; `run` uses the generic
+        # bounded runtime; `serve` serves the generic console API; `migrate`
+        # uses the explicit generic migration; `status`, `supervise` and
+        # `retention` are the generic read/supervision/backup paths; `ask`
+        # queries kept local goal evidence without any model call.
+        # No `generic` alias remains.
+        return run_cmd([str(ROOT / "tools" / "generic_cli.py"), *supplied[1:]])
     args = build_parser().parse_args(argv)
     forwarded = [str(ROOT / "tools" / args.worker)]
     if args.worker_flag:
         forwarded.append(args.worker_flag)
-    if args.command == "ask":
-        forwarded.append(args.query)
-    elif args.command == "eval" and args.eval_cmd != "digest":
+    if args.command == "eval" and args.eval_cmd != "digest":
         forwarded.append(str(args.fixture))
     for field in (
-        "db", "wiki", "topics", "topic", "max_topics", "mode", "limit", "port", "host",
+        "db", "wiki", "topics", "topic", "max_topics", "mode", "port", "host",
         "channel", "day", "as_of", "out", "root", "restore", "keep", "event_json",
         "item_id", "reaction", "since",
     ):

@@ -2,6 +2,12 @@
 
 Written 2026-10-04. The crawl logic itself is in [DESIGN.md](DESIGN.md), and the outside projects we borrow from are in [FEATURE_MATRIX.md](FEATURE_MATRIX.md).
 
+The sections below are the legacy lead-crawler feature list, amended on 2026-10-08 for public-page access. Where they say the agent grows without an approval queue, that sentence belongs to that crawler.
+
+The goal-contract harness is specified in [superpowers/specs/2026-10-09-snowball-goal-harness-design.md](superpowers/specs/2026-10-09-snowball-goal-harness-design.md) and tasked in [superpowers/plans/2026-10-09-snowball-goal-harness-plan.md](superpowers/plans/2026-10-09-snowball-goal-harness-plan.md). Those approved files stay unchanged. Operator install, explicit corpus migration, full-bundle rollback, interview, hash approval, a separate grant, console sign-in, and the Oracle cutover are in [../README.md](../README.md). Architecture additions are [SYSTEM_DESIGN.md](SYSTEM_DESIGN.md) sections 1.6, 5.5, 6.10, and 7.5. A v2 or v3 pre-change bundle is named `goal-v{2|3}-{unix}-{8 hex}` under the bundle root. Exit 2 JSON does not print that path. A failure inside `create_bundle` deletes the incomplete directory, so its absence means the bundle was removed, not that migrate never started. A failure in the schema transaction after `create_bundle` returns leaves that verified directory in place and does not advance `schema_version`.
+
+The frozen profile snapshot keeps unknown and unconfirmed private provenance. Required public scope and finite limits are confirmed. Explicit bounded public research can proceed while private eligibility stays unknown. Consent false does not invent cash or a nationality, and it does not schedule private evaluation. Unknown private criteria block a positive ready result. This pointer does not record harness scenarios G01–G30 as passed, does not record a production deployment, and does not enable `snowball-loop.service`. Design scenarios O01–O03 stay not exercised until a goal, a grant, and a bounded live smoke are approved. Snowball does not install a periodic Gemini hook. A public-only Gemini pass in the build workflow is outside this runtime.
+
 ## Current policy and gate status (2026-10-08)
 
 [SYSTEM_DESIGN.md](SYSTEM_DESIGN.md) is the current policy. This file keeps the original feature list. Section 1's non-goals and row B3 are the amended access text. Invariant I4 in SYSTEM_DESIGN is the access rule. Row I4 in the ops table below is retention. Those are different I4s.
@@ -15,7 +21,7 @@ Gate completion is a verified row in `data/gate-evidence.jsonl` (`fixture_verifi
 Evaluator and production paths differ. T0 does not implement the missing runtime.
 
 - Classifier: `tools/eval_gates.py` `classify_heuristic` is not the fetch pipeline. Owners T5 and T10. Regression `classifier-not-production` blocks M2.01.
-- Extractor: `eval_extract` scores quotes already on fixture rows. Owners T5 and T10. Regression `extractor-not-production` blocks M2.02.
+- Extractor: `eval_extract` scores quotes already on fixture rows. A row that runs the extractor still calls `extract_page_entities(source_text=, url=)`, and that call raises `TypeError`. The public engine entry is `GeminiBulkExtractor.extract(frame, program, field_keys, source, binding, operation_key, max_out)` with `interview.PublicFrame` and `prompts.PublicSourceSnapshot`. `program` is `program_key`, `name`, `institution`, `official_domain`, `degree_level`, `modality`, and `field_tags`, and `field_keys` stays separate. Extract and review binding is exactly `goal_id`, `contract_version`, `strategy_version`, `epoch`, and `task_id`. Review does not take `program` or `field_keys`. Owners T5 and T10. Regression `extractor-not-production` blocks M2.02. This note does not record M2.02 as passed.
 - Digest audit: `eval_digest` accepts quote length over 10 characters and sets the pass flag on 0 quotes. The observed result is 0/0 with the pass flag set. Owner T10. Regressions `digest-eval-zero-over-zero` and `digest-quote-length` block M4.08.
 - Delivery: resolved in code (`tools/digest.py`). `compile_daily_digest` does not set `reported_at`; `reported_at` is written only by `acknowledge_digest` after confirmed Discord delivery.
 - Reindex: an empty `reindex_fts` does not prove M2.12. Owner T8. Regression `empty-reindex`.
@@ -42,7 +48,7 @@ A research agent that runs 24/7 and never stops digging.
 - **Authorized public access only.** Login, paywall, robots, explicit denial, and rate-limit bans stop escalation. Supported public challenges on an `access.yml` origin may use one bounded managed, residential, or solver step after provider activation. That is not a bypass, and the code path is not activation.
 - **No restricted sources.** It does not crawl leak, warez or credential sites.
 - **No acting on findings.** It does not apply for anything or post anything.
-- **No approval queue.** It grows by itself. Human feedback is optional and only adjusts scores.
+- **No approval queue in the legacy crawler.** That crawler grew from seeds and the web. Human feedback was optional and only adjusted scores. The goal harness supersedes this bullet for acquisition: a wave runs only under an approved contract and a separate execution grant.
 
 ## 2. Features
 

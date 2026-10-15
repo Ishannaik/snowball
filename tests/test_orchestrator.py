@@ -6,12 +6,14 @@ python3 -m unittest tests/test_orchestrator.py -v
 import hashlib
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 _spec = importlib.util.spec_from_file_location("orchestrator", ROOT / "tools/orchestrator.py")
@@ -113,226 +115,458 @@ class Primitives(unittest.TestCase):
         self.assertTrue(o.mechanical_check({"amount": 50000.0}, "grants up to $50k each")[0])
 
 
-class StubEngine:
-    """Replaces Engine._call. Records every call, so a private-topic test can prove zero leakage."""
-
-    def __init__(self, replies):
-        self.replies, self.calls = list(replies), []
-
-    def __call__(self, system, user, max_out):
-        self.calls.append(user)
-        r = self.replies.pop(0) if self.replies else '{"rows":[],"names":[],"claims":[],"verdicts":[]}'
-        if isinstance(r, Exception):
-            raise r
-        return o.EngineReply(r, 100, 50, "stub")
+class _Reply:
+    def __init__(self, text: str, requested: str, reported: str, transport: str = "api") -> None:
+        self.text = text
+        self.tokens_in = 12
+        self.tokens_out = 8
+        self.model = reported
+        self.requested_model = requested
+        self.reported_model = reported
+        self.transport = transport
+        self.usage_kind = "estimated" if transport in {"omp", "ssh-omp", "agy"} else "unknown"
 
 
-EXTRACT_REPLY = json.dumps(
-    {
-        "rows": [
-            {
-                "name": "Mozilla Technology Fund",
-                "org": "Mozilla Foundation",
-                "kind": "grant",
-                "amount": 50000,
-                "currency": "USD",
-                "deadline": "2026-12-15",
-                "eligibility": "Individuals and organisations from any country",
-                "link": None,
-                "evidence_quote": "The Mozilla Foundation offers grants of up to $50,000 for open-source projects",
-            },
-            {
-                "name": "Ghost Grant",
-                "kind": "grant",
-                "evidence_quote": "Ghost Grant gives everyone free money every single day forever.",
-            },
-        ],
-        "names": ["Mozilla Foundation"],
-        "claims": [
-            {
-                "text": "Mozilla Technology Fund applications close on 2026-12-15.",
-                "evidence_quote": "Mozilla Technology Fund 2026 is open. The Mozilla Foundation offers grants",
-            }
-        ],
-    }
+class _PlanEngine:
+    def available(self):
+        return True, "ok"
+
+    def plan(self, *_args, **_kwargs):
+        return _Reply('{"hypotheses":[]}', "plan-test", "plan-test")
+
+
+_SOURCE = (
+    "Northwind Masters publishes a public computing programme for 2026-fall. "
+    "Tuition is 12000 USD total for 2026-fall."
 )
-VERIFY_KEEP = json.dumps({"verdicts": [{"id": 0, "verdict": "keep", "reason": "supported", "india_eligible": "yes"}]})
+_ENGINE_BINDING = {"goal_id", "contract_version", "strategy_version", "epoch", "task_id"}
 
 
-class Pipeline(unittest.TestCase):
+class _ExtractEngine:
+    def available(self):
+        return True, "ok"
+
+    def extract(self, frame, program, field_keys, source, binding, operation_key, max_out):
+        o._sibling("prompts").compile_extract_fields(frame, program, field_keys, source)
+        if set(binding) != _ENGINE_BINDING or not isinstance(operation_key, str) or type(max_out) is not int:
+            raise TypeError("binding")
+        text = source.text
+        name = "Northwind Masters"
+        name_at = text.index(name)
+        tuition = "Tuition is 12000 USD total for 2026-fall."
+        tuition_at = text.index(tuition)
+        payload = {
+            "program": {"name": name},
+            "observations": [
+                {
+                    "field_key": "program_name",
+                    "value": name,
+                    "quote": name,
+                    "quote_start": name_at,
+                    "quote_end": name_at + len(name),
+                },
+                {
+                    "field_key": "tuition",
+                    "value": {"amount": "12000", "currency": "USD"},
+                    "currency": "USD",
+                    "period": "total",
+                    "quote": tuition,
+                    "quote_start": tuition_at,
+                    "quote_end": tuition_at + len(tuition),
+                    "subject": {"cycle_label": "2026-fall"},
+                },
+            ],
+        }
+        return _Reply(json.dumps(payload), "gemini-3.8-flash", "gemini-3.8-flash")
+
+
+class _ReviewEngine:
+    def available(self):
+        return True, "ok"
+
+    def review(self, frame, observations, source, binding, operation_key, max_out):
+        o._sibling("prompts").compile_review_observations(frame, observations, source)
+        if set(binding) != _ENGINE_BINDING or not isinstance(operation_key, str) or type(max_out) is not int:
+            raise TypeError("binding")
+        verdicts = [
+            {"id": item["id"], "verdict": "keep", "reason": "the quote is in the public source"}
+            for item in observations
+        ]
+        return _Reply(json.dumps({"verdicts": verdicts}), "review-test", "review-test")
+
+
+class GoalWave(unittest.TestCase):
+    LIMITS = {
+        "day": {"fetches": 5, "queries": 5, "model_tokens": 100000},
+        "lifetime": {
+            "fetches": 20, "queries": 20, "model_tokens": 400000,
+            "queued_nodes": 20, "visited_nodes": 20,
+        },
+        "max_depth": 2, "max_queue": 10, "per_domain_inflight": 2,
+        "max_hypotheses_per_wave": 2, "exploration_share": 0, "usage_mode": "estimated",
+    }
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.db = Path(self.tmp.name) / "snowball.db"
-        o.RAW_DIR = Path(self.tmp.name) / "raw"
         self.cfg = o.load_config()
-        self.cfg.gemini_api_key = "test-key"
+        self.cfg.plan_tokens_per_wave = 100
+        self.cfg.review_budget = (1000, 100)
         self.store = o.Store.open(self.db)
+        with self.store.tx() as db:
+            db.execute(
+                "INSERT INTO families(name, recheck_days, weight, relevance_floor, focus) "
+                "VALUES ('opportunities', 14, 1.0, 0.0, 'public programmes')"
+            )
 
     def tearDown(self):
         self.store.db.close()
         self.tmp.cleanup()
 
-    def make(self, mode="auto", page_text=PAGE, private=False):
-        orch = o.SnowballOrchestrator(self.cfg, self.store, mode=mode)
-        orch.seed_from_yaml = lambda: 0
-        with self.store.tx() as db:
-            db.execute(
-                "INSERT INTO families(name, recheck_days, focus) VALUES ('opportunities', 14, 'grants') "
-                "ON CONFLICT DO NOTHING"
-            )
-            orch.locks.topic_lock(
-                db,
-                "open source grants",
-                "grants for open-source AI accountability projects",
-                "opportunities",
-                "seed",
-                private=private,
-                key="oss-grants",
-            )
-        orch.router.exa_allowed = lambda: True
-        orch.router.search = lambda raw, source, days, family="opportunities": (
-            [SearchHit("https://foundation.mozilla.org/en/what-we-fund/?utm_source=x", "MTF", "", "direct")]
-            if source == "exa"
-            else []
-        )
-        orch.router.fetch = lambda url, hit=None, private=False, **_ignored: FetchResult(
-            o.canonical_url(url), "direct", "ok", 200, "Mozilla Technology Fund", page_text, final_url=url
-        )
-        orch.local.available = lambda: (True, "ok")
-        orch.grok.available = lambda: (True, "ok")
-        return orch
+    def _policy(self):
+        return {
+            "max_depth": 2, "max_queue": 10, "per_domain_inflight": 2,
+            "max_hypotheses_per_wave": 2, "exploration_share": 0,
+            "lifetime_limits": self.LIMITS["lifetime"],
+        }
 
-    def test_full_dag_commits_and_rejects(self):
-        orch = self.make()
-        orch.gemini._call = gem = StubEngine([EXTRACT_REPLY])
-        orch.grok._call = grok = StubEngine([VERIFY_KEEP])
-        summary = orch.run(1, "oss-grants")
-        self.assertEqual(len(gem.calls), 1)
-        self.assertEqual(len(grok.calls), 1)
-        self.assertIn("<untrusted_source", gem.calls[0])
-        ents = self.store.all("SELECT key, amount, deadline FROM entities")
-        self.assertEqual([e["key"] for e in ents], ["mozilla-technology-fund|mozilla-foundation|2026"])
-        self.assertEqual(self.store.one("SELECT count(*) n FROM claims")["n"], 1)
-        self.assertEqual(self.store.one("SELECT status FROM pages")["status"], "scheduled")
-        self.assertEqual(summary["topics"][0]["rows_guard_dropped"], 1)  # Ghost Grant never reached the DB
-        spend = {r["engine"]: r["tokens_in"] for r in self.store.all("SELECT * FROM engine_spend")}
-        self.assertEqual(set(spend), {"gemini", "grok"})
-
-    def test_grok_drop_is_final_and_logged(self):
-        orch = self.make()
-        orch.gemini._call = StubEngine([EXTRACT_REPLY])
-        orch.grok._call = StubEngine(
+    def _running(self, slug="northwind"):
+        goal = o._sibling("goal")
+        interview = o._sibling("interview")
+        selected = goal.create_goal(self.store, slug, "Synthetic public programmes", "fixture")
+        components = {key: False for key in interview.COMPONENT_KEYS}
+        policy = {
+            "lifetime_limits": {
+                "queued_nodes": 20, "visited_nodes": 20, "fetches": 20,
+                "queries": 20, "model_tokens": 400000,
+            },
+            "max_depth": 2, "max_queue": 10, "per_domain_inflight": 2,
+            "max_hypotheses_per_wave": 2, "exploration_share": 0, "usage_mode": "estimated",
+        }
+        monitoring = {
+            "permitted_work": ["recheck_official_sources"],
+            "max_refreshes": 1, "interval_days": 30,
+        }
+        goal.apply_answers(
+            self.store, selected.id,
             [
-                json.dumps(
-                    {
-                        "verdicts": [
-                            {
-                                "id": 0,
-                                "verdict": "drop",
-                                "reason": "deadline unsupported",
-                                "unsupported_fields": ["deadline"],
-                            }
-                        ]
-                    }
-                )
-            ]
+                ("degree_level", "masters", True, "public_ok"),
+                ("modality", "on_campus", True, "public_ok"),
+                ("field_tags", ["computing"], True, "public_ok"),
+                ("regions", [], True, "public_ok"),
+                ("intake_windows", ["2026-fall"], True, "public_ok"),
+                ("scope_broad_acknowledged", True, True, "public_ok"),
+                ("required_components", components, True, "public_ok"),
+                ("grants_only", True, True, "public_ok"),
+                ("completion_min_candidates", 1, True, "public_ok"),
+                ("execution_policy", policy, True, "public_ok"),
+                ("monitoring", monitoring, True, "public_ok"),
+                ("consent_private_evaluation", False, True, "private"),
+            ],
+            selected.row_version, "fixture",
         )
-        orch.run(1, "oss-grants")
-        self.assertEqual(self.store.one("SELECT count(*) n FROM entities")["n"], 0)
-        self.assertEqual(self.store.one("SELECT count(*) n FROM verify_log WHERE tier=3")["n"], 1)
+        selected = goal.get_goal(self.store, selected.id)
+        snapshot = {
+            key: {
+                "value": item.value, "status": item.status,
+                "provenance": item.provenance, "visibility": item.visibility,
+            }
+            for key, item in goal.fields(self.store, selected.id).items()
+        }
+        proposed = goal.propose_contract(
+            self.store, selected.id, interview.build_contract(snapshot), None, "fixture",
+            expected_row_version=selected.row_version,
+        )
+        selected = goal.get_goal(self.store, selected.id)
+        goal.approve_contract(
+            self.store, selected.id, proposed.version, proposed.body_hash,
+            selected.row_version, "fixture", slug + "-approve",
+        )
+        selected = goal.get_goal(self.store, selected.id)
+        goal.grant_execution(
+            self.store, selected.id, proposed.version, "research", self.LIMITS, o.now() + 3600,
+            selected.row_version, "fixture", slug + "-grant",
+        )
+        selected = goal.get_goal(self.store, selected.id)
+        return goal.transition(self.store, selected.id, "start", "", selected.row_version, "fixture", slug + "-start")
 
-    def test_entity_change_is_a_diff(self):
-        orch = self.make()
-        orch.gemini._call = StubEngine([EXTRACT_REPLY])
-        orch.grok._call = StubEngine([VERIFY_KEEP])
-        orch.run(1, "oss-grants")
-        page2 = PAGE.replace("$50,000", "$75,000")
-        orch2 = self.make(page_text=page2)
-        with self.store.tx() as db:  # make the page and topic due again
-            db.execute("UPDATE pages SET next_check_at=0")
-            db.execute("UPDATE topics SET last_run_at=0")
-        orch2.gemini._call = StubEngine([EXTRACT_REPLY.replace("50000", "75000").replace("$50,000", "$75,000")])
-        orch2.grok._call = StubEngine([VERIFY_KEEP])
-        orch2.run(1, "oss-grants")
-        ch = self.store.all("SELECT field, old, new FROM entity_changes")
-        self.assertEqual([(c["field"], c["new"]) for c in ch], [("amount", "75000.0")])
-        self.assertEqual(self.store.one("SELECT status FROM entities")["status"], "changed")
+    def test_extract_rejects_raw_source_text(self):
+        with self.assertRaises(TypeError):
+            o.extract_page_entities("raw page text", "https://example.com/programme")
+        interview = o._sibling("interview")
+        prompts = o._sibling("prompts")
+        text = _SOURCE
+        source = prompts.PublicSourceSnapshot(
+            id=1, url="https://example.com/northwind", title="Northwind Masters", text=text,
+            content_hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            source_cycle_label="2026-fall", applicability={"cycle_label": "2026-fall"},
+        )
+        frame = interview.PublicFrame(
+            domain=interview.DOMAIN,
+            public_objective="masters_funding: masters on_campus programs in computing; scope explicitly acknowledged broad scope; intakes 2026-fall",
+            public_criteria={
+                "degree_level": "masters",
+                "modality": "on_campus",
+                "required_components": {key: False for key in interview.COMPONENT_KEYS},
+                "grants_only": True,
+            },
+            field_tags=["computing"],
+            regions=[],
+            intake_windows=["2026-fall"],
+            required_source_fields=["tuition"],
+        )
+        binding = {"goal_id": 1, "contract_version": 1, "strategy_version": 1, "epoch": 1, "task_id": 1}
 
-    def test_private_topic_never_leaves_the_box(self):
-        orch = self.make(mode="gemini-bulk", private=True)
-        orch.gemini._call = gem = StubEngine([])
-        orch.grok._call = grok = StubEngine([])
-        orch.grok.x_search = lambda *a: self.fail("X search on a private topic")
-        orch.local._call = local = StubEngine([EXTRACT_REPLY, VERIFY_KEEP])
-        orch.run(1, "oss-grants")
-        self.assertEqual((len(gem.calls), len(grok.calls)), (0, 0))
-        self.assertEqual(len(local.calls), 2)
-        self.assertEqual(self.store.one("SELECT count(*) n FROM entities")["n"], 1)
-        self.assertNotIn("grok", [q["source"] for q in self.store.all("SELECT source FROM queries")])
+        class _Refuse:
+            def extract(self, *_args, **_kwargs):
+                raise AssertionError("engine must not run")
 
-    def test_outage_pauses_engine_refunds_and_defers(self):
-        orch = self.make()
-        orch.gemini._call = StubEngine([o.EngineOutage("HTTP 429", retry_after=120)])
-        orch.run(1, "oss-grants")
-        self.assertEqual(self.store.one("SELECT status FROM pages")["status"], "fetched")  # waits, not scheduled
-        t = self.store.one("SELECT status, attempts, outage_pauses FROM tasks WHERE kind='extract'")
-        self.assertEqual((t["status"], t["attempts"], t["outage_pauses"]), ("pending", 0, 1))
-        st = self.store.one("SELECT paused_until FROM engine_state WHERE engine='gemini'")
-        self.assertGreater(st["paused_until"], o.now() + 100)
-        # next run: Gemini is paused, so auto mode extracts the leftover page locally
-        orch2 = self.make()
-        orch2.local._call = StubEngine([EXTRACT_REPLY])
-        orch2.grok._call = StubEngine([VERIFY_KEEP])
+        with self.assertRaises(TypeError):
+            o.extract_page_entities(
+                frame, {"name": "Northwind Masters", "profile_snapshot_hash": "abc"},
+                ["tuition"], source, binding, "extract-op", _Refuse(), 100,
+            )
+        with self.assertRaises(TypeError):
+            o.extract_page_entities(
+                frame, {"name": "Northwind Masters"}, ["tuition"], "raw page text",
+                binding, "extract-op", _Refuse(), 100,
+            )
+
+    def test_absent_paused_ready_and_expired_make_no_external_calls(self):
+        idle = o.SnowballOrchestrator(self.cfg, self.store)
+        absent = idle.run(1, "forced-topic")
+        self.assertEqual(absent["reason"], "no_goal")
+        self.assertEqual(absent["external_calls"], 0)
+        self.assertEqual(self.store.one("SELECT count(*) n FROM fetches")["n"], 0)
+
+        running = self._running()
+        goal = o._sibling("goal")
+        paused = goal.transition(
+            self.store, running.id, "pause", "", running.row_version, "fixture", "pause-northwind",
+        )
+        held = o.SnowballOrchestrator(self.cfg, self.store).run(1, "forced-topic")
+        self.assertEqual(held["reason"], "goal_paused")
+        self.assertEqual(held["external_calls"], 0)
+
         with self.store.tx() as db:
-            db.execute("UPDATE topics SET last_run_at=0")
-        orch2.run(1, "oss-grants")
-        self.assertEqual(self.store.one("SELECT count(*) n FROM entities")["n"], 1)
+            db.execute("UPDATE goals SET state='research_ready' WHERE id=?", (paused.id,))
+        ready = o.SnowballOrchestrator(self.cfg, self.store).run(1, None)
+        self.assertEqual(ready["reason"], "research_ready")
+        self.assertEqual(ready["external_calls"], 0)
 
-    def test_daily_cap_cuts_cleanly(self):
-        self.cfg.caps["gemini"] = 10
-        orch = self.make(mode="gemini-bulk")
-        orch.gemini._call = StubEngine([EXTRACT_REPLY])
-        summary = orch.run(1, "oss-grants")
-        self.assertEqual(self.store.one("SELECT count(*) n FROM entities")["n"], 0)
-        self.assertTrue(summary["topics"][0].get("error") or summary["topics"][0].get("budget_cut"))
-
-    def test_query_lock_skips_second_run(self):
-        orch = self.make()
-        orch.gemini._call = StubEngine([EXTRACT_REPLY])
-        orch.grok._call = StubEngine([VERIFY_KEEP])
-        orch.run(1, "oss-grants")
-        n1 = self.store.one("SELECT count(*) n FROM queries")["n"]
         with self.store.tx() as db:
-            db.execute("UPDATE topics SET last_run_at=0")
-        orch.run(1, "oss-grants")
-        seed = "SELECT count(*) n FROM queries WHERE discovered_via='seed'"
-        self.assertEqual(self.store.one(seed)["n"], n1)  # the same seed words are never searched twice
-        self.assertGreater(self.store.one("SELECT sum(dup_requests) n FROM queries")["n"], 0)
-        # run 1 found "Mozilla Foundation" in the page; run 2 spends exactly one search on it
-        nq = self.store.all("SELECT raw FROM queries WHERE discovered_via='name'")
-        self.assertEqual([q["raw"] for q in nq], ["Mozilla Foundation"])
-        self.assertEqual(self.store.one("SELECT status FROM names")["status"], "searched")
-        with self.store.tx() as db:
-            db.execute("UPDATE topics SET last_run_at=0")
-        orch.run(1, "oss-grants")
-        self.assertEqual(len(self.store.all("SELECT raw FROM queries WHERE discovered_via='name'")), 1)
-        self.assertEqual(self.store.one("SELECT count(*) n FROM fetches")["n"], 1)  # page not due: never re-fetched
+            db.execute("UPDATE goals SET state='running' WHERE id=?", (paused.id,))
+            db.execute(
+                "UPDATE execution_grants SET expires_at=? WHERE goal_id=? AND state='active'",
+                (o.now() - 10, paused.id),
+            )
+        expired = o.SnowballOrchestrator(self.cfg, self.store).run(1, "forced-topic")
+        self.assertEqual(expired["reason"], "grant_expired")
+        self.assertEqual(expired["external_calls"], 0)
+        self.assertEqual(self.store.one("SELECT count(*) n FROM fetches")["n"], 0)
 
-    def test_entity_lock_omitted_link_uses_fetched_page_canon(self):
-        orch = self.make()
-        orch.gemini._call = StubEngine([EXTRACT_REPLY])  # row link is None
-        orch.grok._call = StubEngine([VERIFY_KEEP])
-        orch.run(1, "oss-grants")
-        page = self.store.one("SELECT id, canon_url FROM pages")
-        ent = self.store.one("SELECT evidence_page_id, link FROM entities")
-        self.assertEqual(ent["evidence_page_id"], page["id"])
-        self.assertEqual(ent["link"], page["canon_url"])
+    def test_local_source_fact_is_reviewed_kept(self):
+        running = self._running("local-fact")
+        text = _SOURCE
+        with self.store.tx() as db:
+            _verdict, topic_id = o.SnowballOrchestrator(self.cfg, self.store).locks.topic_lock(
+                db, "Northwind", "public programmes", "opportunities", "seed", key="northwind",
+            )
+            page_id = o.SnowballOrchestrator(self.cfg, self.store).locks.enqueue_url(
+                db, "https://example.com/northwind", topic_id, "seed", 14,
+            )
+            self.assertIsNotNone(page_id)
+            db.execute(
+                """INSERT INTO tasks(
+                       kind, payload, priority, status, next_attempt_at, created_at,
+                       goal_id, contract_version, strategy_version, epoch, grant_id)
+                   VALUES ('fetch', ?, 1, 'pending', ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    json.dumps({"page_id": page_id, "url": "https://example.com/northwind"}),
+                    o.now(), o.now(), running.id, running.current_contract_version,
+                    running.current_strategy_version, running.epoch,
+                    o._sibling("goal").active_grant(self.store, running.id).id,
+                ),
+            )
+        orch = o.SnowballOrchestrator(self.cfg, self.store)
+        extract, review = _ExtractEngine(), _ReviewEngine()
+        orch.extract_engine = lambda: extract
+        orch.review_engine = lambda: review
+        orch.plan_engine = lambda: _PlanEngine()
+        orch.router.fetch = lambda *_args, **_kwargs: FetchResult(
+            "https://example.com/northwind", "direct", "ok", 200, "Northwind Masters", text,
+        )
+        orch.router.search = lambda *_args, **_kwargs: []
+        result = orch.run(1, None)
+        self.assertNotEqual(result["reason"], "research_ready")
+        self.assertGreater(result["external_calls"], 0)
+        kept = {
+            row["field_key"]: row
+            for row in self.store.all(
+                """SELECT field_key, assurance, quote, goal_id, contract_version, strategy_version, epoch
+                     FROM observations"""
+            )
+        }
+        self.assertEqual(kept["program_name"]["assurance"], "reviewed_kept")
+        self.assertEqual(kept["program_name"]["quote"], "Northwind Masters")
+        self.assertEqual(kept["tuition"]["assurance"], "reviewed_kept")
+        self.assertIn("12000", kept["tuition"]["quote"])
+        self.assertIn("USD", kept["tuition"]["quote"])
+        self.assertIn("total", kept["tuition"]["quote"])
+        self.assertIn("2026-fall", kept["tuition"]["quote"])
+        for row in kept.values():
+            self.assertEqual(row["goal_id"], running.id)
+            self.assertEqual(row["contract_version"], running.current_contract_version)
+            self.assertEqual(row["strategy_version"], running.current_strategy_version)
+            self.assertEqual(row["epoch"], running.epoch)
+        snap = self.store.one(
+            """SELECT content_hash, visibility, provenance, source_cycle_label
+                 FROM source_snapshots"""
+        )
+        self.assertEqual(snap["content_hash"], hashlib.sha256(text.encode("utf-8")).hexdigest())
+        self.assertEqual(snap["visibility"], "public")
+        self.assertEqual(snap["provenance"], "public_fetch")
+        self.assertEqual(snap["source_cycle_label"], "2026-fall")
+        prompts = o._sibling("prompts")
+        calls = {
+            row["role"]: row
+            for row in self.store.all(
+                """SELECT role, requested_model, reported_model, usage_kind, prompt_version
+                     FROM model_calls"""
+            )
+        }
+        self.assertEqual(calls["extract"]["requested_model"], "gemini-3.8-flash")
+        self.assertEqual(calls["extract"]["reported_model"], "gemini-3.8-flash")
+        self.assertEqual(calls["extract"]["usage_kind"], "unknown")
+        self.assertEqual(calls["extract"]["prompt_version"], prompts.PROMPTS["extract_fields"]["version"])
+        self.assertNotEqual(calls["extract"]["prompt_version"], "public-source-1")
+        self.assertEqual(calls["review"]["requested_model"], "review-test")
+        self.assertEqual(calls["review"]["reported_model"], "review-test")
+        self.assertEqual(calls["review"]["usage_kind"], "unknown")
+        self.assertEqual(calls["review"]["prompt_version"], prompts.PROMPTS["review_observations"]["version"])
+        self.assertIsNone(calls.get("private_eval"))
+        self.assertEqual(self.store.one("SELECT count(*) n FROM model_calls WHERE role='private_eval'")["n"], 0)
+        self.assertGreater(self.store.one("SELECT count(*) n FROM constraint_evaluations")["n"], 0)
+        self.assertIn(
+            "unknown",
+            {row["status"] for row in self.store.all("SELECT status FROM constraint_evaluations")},
+        )
+        completion = o._sibling("qualify").completion_status(self.store, running)
+        self.assertFalse(completion.ready)
+        fresh = o._sibling("goal").get_goal(self.store, running.id)
+        self.assertNotEqual(fresh.state, "research_ready")
+        private = {
+            row["key"] for row in self.store.all(
+                """SELECT key FROM profile_fields
+                    WHERE key IN ('max_upfront_cash', 'citizenship', 'prior_degree')"""
+            )
+        }
+        self.assertEqual(private, set())
+        consent = self.store.one(
+            "SELECT value_json FROM profile_fields WHERE key='consent_private_evaluation'"
+        )
+        self.assertIn("false", consent["value_json"])
+
+    def test_status_and_dry_run_do_not_write(self):
+        self.store.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        before = hashlib.sha256(self.db.read_bytes()).hexdigest()
+        status = o.SnowballOrchestrator(self.cfg, self.store).status()
+        self.assertIn("domain_yield", status)
+        self.assertIn("goal", status)
+        self.assertNotIn("gemini_api_key", json.dumps(status))
+        dry = o.SnowballOrchestrator(self.cfg, self.store, dry=True)
+        waved = dry.run(2, "forced-topic")
+        self.assertEqual(waved["external_calls"], 0)
+        self.assertTrue(waved["dry_run"])
+        self.store.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        self.assertEqual(hashlib.sha256(self.db.read_bytes()).hexdigest(), before)
+
+
+def _link_dir(src: Path, dst: Path) -> None:
+    src.mkdir(parents=True, exist_ok=True)
+    try:
+        os.symlink(src, dst, target_is_directory=True)
+    except OSError:
+        subprocess.check_call(["cmd", "/c", "mklink", "/J", str(dst), str(src)])
+
+
+def _drop_reparse(path: Path) -> None:
+    if not os.path.lexists(path):
+        return
+    try:
+        path.unlink()
+    except OSError:
+        os.rmdir(path)
+
+
+_PATH_RESOLVE = Path.resolve
+
+
+def _refuse_db_resolve(self, *args, **kwargs):
+    if self.name in {"fresh.db", "leaf.db", "secret.db", "link"} or "link" in self.parts:
+        raise AssertionError("resolve")
+    return _PATH_RESOLVE(self, *args, **kwargs)
+
+
+class StorePathGuard(unittest.TestCase):
+    def test_reparse_is_refused_before_resolve_or_sqlite(self):
+        migration = o._sibling("migration")
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            real = root / "real"
+            real.mkdir()
+            sentinel = real / "secret.db"
+            sentinel.write_bytes(b"do-not-touch")
+            link = root / "link"
+            leaf = root / "leaf.db"
+            try:
+                _link_dir(real, link)
+                self.assertTrue(migration.is_reparse(link))
+                with patch.object(Path, "resolve", _refuse_db_resolve):
+                    for opening in (
+                        lambda: o.Store.open(link / "fresh.db"),
+                        lambda: o.Store.connect_existing(link / "secret.db"),
+                        lambda: o.Store.migrate(link / "secret.db"),
+                        lambda: o.Store.open(link / "nested" / "fresh.db"),
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, "reparse"):
+                            opening()
+                self.assertEqual(sorted(p.name for p in real.iterdir()), ["secret.db"])
+                self.assertEqual(sentinel.read_bytes(), b"do-not-touch")
+
+                target = root / "target.db"
+                try:
+                    target.write_bytes(b"leaf-secret")
+                    os.symlink(target, leaf)
+                except OSError:
+                    if target.exists():
+                        target.unlink()
+                    _link_dir(target, leaf)
+                self.assertTrue(migration.is_reparse(leaf))
+                with patch.object(Path, "resolve", _refuse_db_resolve):
+                    for opening in (
+                        lambda: o.Store.open(leaf),
+                        lambda: o.Store.connect_existing(leaf),
+                        lambda: o.Store.migrate(leaf),
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, "reparse"):
+                            opening()
+                if target.is_file():
+                    self.assertEqual(target.read_bytes(), b"leaf-secret")
+                else:
+                    self.assertEqual(list(target.iterdir()), [])
+            finally:
+                _drop_reparse(link)
+                _drop_reparse(leaf)
 
 
 class Cli(unittest.TestCase):
     def test_status_and_dry_run_leave_db_untouched(self):
         with tempfile.TemporaryDirectory() as td:
             db = Path(td) / "s.db"
+            opened = o.Store.open(db)
+            opened.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            opened.db.close()
 
             def run(*a):
                 return subprocess.run(
@@ -349,10 +583,10 @@ class Cli(unittest.TestCase):
             r = run("--dry-run", "--max-topics", "2")
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertIn("dry run", r.stdout)
-            self.assertIn("would call: search", r.stdout)
+            self.assertNotIn("would call: search", r.stdout)
             self.assertEqual(hashlib.sha256(db.read_bytes()).hexdigest(), before)
 
-    def test_run_once_researches_topic_from_explicit_configuration(self):
+    def test_run_once_without_a_goal_makes_no_search(self):
         with tempfile.TemporaryDirectory() as td:
             topics = Path(td) / "topics.yml"
             topics.write_text(
@@ -364,20 +598,22 @@ class Cli(unittest.TestCase):
                 "    audiences: [students]\n",
                 encoding="utf-8",
             )
+            db = Path(td) / "research.db"
+            opened = o.Store.open(db)
+            opened.db.close()
             result = subprocess.run(
                 [
                     sys.executable, str(ROOT / "snowball.py"), "run-once",
                     "--topics", str(topics), "--topic", "funded-on-campus-masters",
-                    "--db", str(Path(td) / "research.db"), "--dry-run", "--json",
+                    "--db", str(db), "--dry-run", "--json",
                 ],
                 capture_output=True, text=True, timeout=120,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             wave = json.loads(result.stdout)
-            self.assertEqual(
-                [topic["topic"] for topic in wave["topics"]],
-                ["funded-on-campus-masters"],
-            )
+            self.assertEqual(wave["reason"], "no_goal")
+            self.assertEqual(wave["topics"], [])
+            self.assertEqual(wave["external_calls"], 0)
 
 
 class RuntimeBehaviorGates(unittest.TestCase):
@@ -708,8 +944,10 @@ class RuntimeBehaviorGates(unittest.TestCase):
         self.assertEqual(diag["gemini"]["status"], "blocked")
         self.assertIn("not configured", diag["gemini"]["error"])
         self.assertIn("exa", diag)
-        self.assertIn("grok", diag)
-        self.assertIn("local", diag)
+        self.assertIn("review", diag)
+        self.assertIn("private", diag)
+        self.assertNotIn("grok", diag)
+        self.assertNotIn("local", diag)
 
     def test_provider_diagnostics_ssh_omp_transport(self):
         """T1: Provider diagnostics supports explicit ssh-omp transport with ssh host check."""

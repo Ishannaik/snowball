@@ -7,6 +7,7 @@ import datetime as dt
 import importlib.util
 import io
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -217,7 +218,12 @@ class TestWikiCompiler(unittest.TestCase):
         self.assertIn("Alpha funds 12 teams.", text)
         self.assertIn("https://example.com/apply", text)
         self.assertIn("deadline: 2026-11-01 → 2026-12-15", text)
-        idx_path = self.wiki_dir / "index.md" if (self.wiki_dir / "index.md").is_file() else self.wiki_dir / "INDEX.md"
+        idx_path = self.wiki_dir / "index.md"
+        self.assertTrue(idx_path.is_file(), idx_path)
+        self.assertEqual(
+            self.conn.execute("SELECT path FROM wiki_pages WHERE kind = 'index'").fetchone()["path"],
+            "index.md",
+        )
         self.assertIn("Alpha Grant", idx_path.read_text(encoding="utf-8"))
 
     def test_human_text_survives_recompile(self):
@@ -233,12 +239,22 @@ class TestWikiCompiler(unittest.TestCase):
         self.conn.commit()
         wiki.compile_wiki(self.conn, self.wiki_dir, full=True)
         text = path.read_text(encoding="utf-8")
-        self.assertIn("## Notes\nHuman kept this paragraph about 4242.", text)
+        marker = "\n## Notes\nHuman kept this paragraph about 4242.\n"
+        self.assertEqual(text[text.index(marker) : text.index(marker) + len(marker)], marker)
+        self.assertEqual(text.count(marker), 1)
         self.assertIn("2222", text)
         self.assertIn("## Facts", text)
         self.assertIn("## Changes", text)
         self.assertIn("## Sources", text)
         self.assertNotIn("1111", text)
+        rows = self.conn.execute(
+            "SELECT provenance, body FROM wiki_regions WHERE path = ?",
+            ("entities/alpha-grant-acme-org-2026.md",),
+        ).fetchall()
+        human_bodies = [row["body"] for row in rows if row["provenance"] == "human_note"]
+        source_bodies = [row["body"] for row in rows if row["provenance"] == "source_evidence"]
+        self.assertTrue(any(marker.strip() in body for body in human_bodies))
+        self.assertFalse(any("Human kept this paragraph about 4242." in body for body in source_bodies))
 
     def test_summary_floor_and_number_survival(self):
         old = "Plan 2024 budget 1500\n" * 30
@@ -412,6 +428,18 @@ class TestWikiCompiler(unittest.TestCase):
         ).fetchone()
         self.assertIsNotNone(hit)
         self.assertIn("alpha-grant", hit["path"])
+        audited = self.conn.execute(
+            "SELECT provenance, body FROM wiki_regions WHERE path = ?",
+            (hit["path"],),
+        ).fetchall()
+        self.assertTrue(any(
+            row["provenance"] == "human_note" and "UniqueHumanNoteZZZ" in row["body"]
+            for row in audited
+        ))
+        self.assertFalse(any(
+            row["provenance"] == "source_evidence" and "UniqueHumanNoteZZZ" in row["body"]
+            for row in audited
+        ))
 
     def test_topics_hubs_and_family_index_generation(self):
         self.conn.executescript(
@@ -482,8 +510,6 @@ class TestWikiCompiler(unittest.TestCase):
         self.assertIn("Grant One", hub_content)
 
         index_file = self.wiki_dir / "index.md"
-        if not index_file.is_file():
-            index_file = self.wiki_dir / "INDEX.md"
         self.assertTrue(index_file.is_file(), index_file)
         index_content = index_file.read_text(encoding="utf-8")
         self.assertIn("## Families & Topics", index_content)
@@ -547,6 +573,161 @@ class TestWikiCompiler(unittest.TestCase):
         cand_fail = wiki.merge_summary_local(old_summary, update, model_callable=failing_model)
         self.assertIn("Cohort launched in 2024 with 50000", cand_fail)
         self.assertIn("Applications for 2026", cand_fail)
+
+    def test_v3_schema_does_not_create_wiki_regions(self):
+        self.conn.execute("CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT)")
+        self.conn.execute("INSERT INTO schema_meta VALUES ('schema_version', '3')")
+        _add_entity(self.conn, key="alpha", name="Alpha Grant", org="Acme Org")
+        self.conn.commit()
+        wiki.compile_wiki(self.conn, self.wiki_dir, full=True)
+        present = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'wiki_regions'"
+        ).fetchone()
+        self.assertIsNone(present)
+
+    def test_observations_regenerate_without_qualifying_notes_or_leads(self):
+        self.conn.executescript(
+            """
+            CREATE TABLE source_snapshots (
+              id INTEGER PRIMARY KEY,
+              page_id INTEGER NOT NULL,
+              content_hash TEXT NOT NULL,
+              retrieved_at INTEGER NOT NULL,
+              text_path TEXT NOT NULL,
+              original_raw_path TEXT,
+              visibility TEXT,
+              provenance TEXT,
+              source_cycle_label TEXT,
+              superseded_by INTEGER
+            );
+            CREATE TABLE observations (
+              id INTEGER PRIMARY KEY,
+              snapshot_id INTEGER NOT NULL,
+              page_id INTEGER NOT NULL,
+              program_key TEXT,
+              field_key TEXT NOT NULL,
+              quote TEXT NOT NULL,
+              quote_start INTEGER NOT NULL,
+              quote_end INTEGER NOT NULL,
+              assurance TEXT NOT NULL,
+              invalidated_at INTEGER,
+              invalidated_reason TEXT
+            );
+            """
+        )
+        self.conn.execute("ALTER TABLE entities ADD COLUMN provenance TEXT")
+        self.conn.execute("ALTER TABLE claims ADD COLUMN provenance TEXT")
+        _add_entity(
+            self.conn,
+            key="alpha",
+            name="Alpha Grant",
+            org="Acme Org",
+            evidence_quote="Legacy entity blurb stays a lead.",
+        )
+        self.conn.execute(
+            "UPDATE entities SET evidence_page_id = 7, provenance = 'legacy_v3' WHERE key = 'alpha'"
+        )
+        self.conn.execute(
+            """
+            INSERT INTO claims (hash, text, entity_key, provenance)
+            VALUES ('c-leg', 'Legacy stipend claim 777.', 'alpha', 'legacy_v3')
+            """
+        )
+        self.conn.execute(
+            """
+            INSERT INTO source_snapshots (
+              id, page_id, content_hash, retrieved_at, text_path, original_raw_path,
+              visibility, provenance, source_cycle_label, superseded_by
+            ) VALUES
+              (1, 7, 'hash-current', 100, 'raw/snap/tuition-2027.txt',
+               'raw/original/tuition-2027.html', 'public', 'public_fetch', '2027', NULL),
+              (2, 7, 'hash-old', 50, 'raw/snap/tuition-2026.txt',
+               'raw/original/tuition-2026.html', 'public', 'public_fetch', '2026', 1)
+            """
+        )
+        current_quote = "Tuition is 48000 USD for the 2027 cohort."
+        historical_quote = "Tuition was 51000 USD for the 2026 cohort."
+        self.conn.execute(
+            """
+            INSERT INTO observations (
+              id, snapshot_id, page_id, program_key, field_key, quote, quote_start, quote_end,
+              assurance, invalidated_at, invalidated_reason
+            ) VALUES
+              (1, 1, 7, 'alpha', 'tuition', ?, 12, 54, 'code_checked', NULL, NULL),
+              (2, 2, 7, 'alpha', 'tuition', ?, 0, 40, 'review_pending', 90, 'source_changed')
+            """,
+            (current_quote, historical_quote),
+        )
+        self.conn.commit()
+        wiki.compile_wiki(self.conn, self.wiki_dir, full=True)
+        path = self.wiki_dir / "entities" / "alpha-grant-acme-org-2026.md"
+        text = path.read_text(encoding="utf-8")
+        current = _region_text(text, "current_evidence")
+        historical = _region_text(text, "historical_evidence")
+        self.assertIn(current_quote, current)
+        self.assertNotIn(historical_quote, current)
+        self.assertIn("assurance `code_checked`", current)
+        self.assertNotIn("reviewed_kept", current)
+        self.assertIn("span 12:54", current)
+        self.assertIn("[text](<raw/snap/tuition-2027.txt>)", current)
+        self.assertIn("[raw](<raw/original/tuition-2027.html>)", current)
+        self.assertIn(historical_quote, historical)
+        self.assertIn("assurance `review_pending`", historical)
+        self.assertNotIn("reviewed_kept", historical)
+        self.assertIn("[text](<raw/snap/tuition-2026.txt>)", historical)
+        for line in text.splitlines():
+            if "Legacy stipend claim 777." in line or "Legacy entity blurb stays a lead." in line:
+                self.assertIn("LEAD", line)
+                self.assertNotIn("reviewed", line.lower())
+        marker = "\n## Notes\nKeep\u00a0this 4242 exactly.\nsecond line  \n"
+        path.write_bytes(path.read_bytes() + marker.encode("utf-8"))
+        self.conn.execute(
+            """
+            UPDATE source_snapshots SET superseded_by = 3 WHERE id = 1
+            """
+        )
+        self.conn.execute(
+            """
+            UPDATE observations
+               SET invalidated_at = 200, invalidated_reason = 'source_changed'
+             WHERE id = 1
+            """
+        )
+        self.conn.execute("UPDATE entities SET amount = 2222 WHERE key = 'alpha'")
+        self.conn.commit()
+        wiki.compile_wiki(self.conn, self.wiki_dir, full=True)
+        regenerated = path.read_text(encoding="utf-8")
+        self.assertEqual(regenerated.count(marker), 1)
+        start = regenerated.index(marker)
+        self.assertEqual(regenerated[start : start + len(marker)], marker)
+        current_after = _region_text(regenerated, "current_evidence")
+        historical_after = _region_text(regenerated, "historical_evidence")
+        self.assertNotIn(current_quote, current_after)
+        self.assertIn(current_quote, historical_after)
+        self.assertIn(historical_quote, historical_after)
+        self.assertIn("assurance `code_checked`", historical_after)
+        self.assertIn("[text](<raw/snap/tuition-2027.txt>)", historical_after)
+        self.assertIn("2222", regenerated)
+        audited = self.conn.execute(
+            "SELECT region_key, provenance, body FROM wiki_regions WHERE path = ?",
+            ("entities/alpha-grant-acme-org-2026.md",),
+        ).fetchall()
+        human_note = "Keep\u00a0this 4242 exactly."
+        self.assertTrue(any(
+            row["provenance"] == "human_note" and human_note in row["body"] for row in audited
+        ))
+        self.assertFalse(any(
+            row["provenance"] == "source_evidence" and human_note in row["body"] for row in audited
+        ))
+
+
+def _region_text(page: str, key: str) -> str:
+    match = re.search(
+        rf"<!-- snowball:{key}:start -->(.*)<!-- snowball:{key}:end -->",
+        page,
+        re.S,
+    )
+    return match.group(1) if match else ""
 
 
 class _DiscordResponse:
@@ -1043,11 +1224,36 @@ class TestAlerts(unittest.TestCase):
 
 
 class TestRetention(unittest.TestCase):
-    def test_prune_backup_expiry_and_quick_check(self):
+    def test_full_bundle_prunes_unpinned_bytes_and_isolated_restore_keeps_edits(self):
+        """Retention writes a full corpus bundle and restores it into a new root.
+
+        Pinned source bytes and human wiki text survive. Unreferenced aged raw,
+        quarantine, and log bytes do not. Restore does not overwrite a later edit.
+        """
+        quoted = "Quoted sentence for the claim."
+        human = "Human note: keep this edit."
+        verbatim = "Human region stays verbatim."
+        wiki_text = (
+            "# Note\n\n"
+            f"{human}\n\n"
+            "## Facts\n\n"
+            "<!-- snowball:facts:start -->\n"
+            "Code-owned fact: synthetic tuition note.\n"
+            "<!-- snowball:facts:end -->\n\n"
+            "## Notes\n\n"
+            f"{verbatim}\n"
+        )
         tmp = tempfile.TemporaryDirectory(prefix="snowball-retain-")
         self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
         now = dt.datetime(2026, 10, 8, 12, 0, tzinfo=dt.timezone.utc)
+        quoted_path = root / "raw" / "2018-06-01" / "quoted.txt"
+        original_path = root / "raw" / "2018-06-01" / "original.bin"
+        loose_path = root / "raw" / "2018-06-01" / "loose.txt"
+        quoted_path.parent.mkdir(parents=True)
+        quoted_path.write_text(quoted, encoding="utf-8")
+        original_path.write_bytes(b"original-bytes")
+        loose_path.write_text("loose unreferenced", encoding="utf-8")
         (root / "raw" / "2026-09-23").mkdir(parents=True)
         (root / "raw" / "2026-09-23" / "old.txt").write_text("old", encoding="utf-8")
         (root / "raw" / "2026-09-24").mkdir(parents=True)
@@ -1056,9 +1262,7 @@ class TestRetention(unittest.TestCase):
         (root / "raw" / "2026-10-01" / "new.txt").write_text("new", encoding="utf-8")
         (root / "quarantine").mkdir()
         (root / "logs").mkdir()
-        (root / "wiki").mkdir()
         (root / "digests").mkdir()
-        (root / "data").mkdir()
         old_file = root / "quarantine" / "old.bin"
         new_file = root / "quarantine" / "new.bin"
         old_log = root / "logs" / "old.log"
@@ -1071,84 +1275,199 @@ class TestRetention(unittest.TestCase):
         os.utime(old_log, (old_ts, old_ts))
         os.utime(new_file, (edge_ts, edge_ts))
         os.utime(new_log, (edge_ts, edge_ts))
-        wiki_page = root / "wiki" / "keep.md"
+        note = root / "wiki" / "entities" / "note.md"
+        note.parent.mkdir(parents=True)
+        note.write_text(wiki_text, encoding="utf-8")
+        os.utime(note, (old_ts, old_ts))
+        note_bytes = note.read_bytes()
         digest_page = root / "digests" / "2026-01-01.md"
-        wiki_page.write_text("keep wiki", encoding="utf-8")
         digest_page.write_text("keep digest", encoding="utf-8")
-        os.utime(wiki_page, (old_ts, old_ts))
         os.utime(digest_page, (old_ts, old_ts))
-        db_path = root / "data" / "snowball.db"
-        conn = sqlite3.connect(db_path)
-        conn.execute("CREATE TABLE entities (key TEXT PRIMARY KEY, deadline TEXT, status TEXT)")
-        conn.execute("INSERT INTO entities VALUES ('old', '2020-01-01', 'new')")
-        conn.execute("INSERT INTO entities VALUES ('live', '2026-12-01', 'new')")
-        conn.execute("INSERT INTO entities VALUES ('done', '2019-01-01', 'expired')")
-        conn.commit()
-        backup_dir = root / "data" / "backup"
-        backup_dir.mkdir()
-        for day in range(1, 9):
-            (backup_dir / f"snowball-2026-01-{day:02d}.db").write_bytes(b"old-backup")
-        stats = retention.run_retention(conn, root_dir=root, now_dt=now)
-        self.assertFalse((root / "raw" / "2026-09-23").exists())
-        self.assertTrue((root / "raw" / "2026-09-24" / "edge.txt").is_file())
-        self.assertTrue((root / "raw" / "2026-10-01" / "new.txt").is_file())
-        self.assertFalse(old_file.exists())
-        self.assertFalse(old_log.exists())
-        self.assertTrue(new_file.is_file())
-        self.assertTrue(new_log.is_file())
-        self.assertEqual(wiki_page.read_text(encoding="utf-8"), "keep wiki")
-        self.assertEqual(digest_page.read_text(encoding="utf-8"), "keep digest")
-        self.assertTrue(db_path.is_file())
-        backups = sorted(path.name for path in backup_dir.glob("snowball-*.db"))
-        self.assertEqual(len(backups), 7)
-        self.assertIn("snowball-2026-10-08.db", backups)
-        self.assertNotIn("snowball-2026-01-01.db", backups)
-        self.assertEqual(stats["quick_check"], "ok")
-        self.assertEqual(stats["backups"], 7)
+
+        migration = _load("migration")
+        orch = _load("orchestrator")
+        store = orch.Store.open(root / "data" / "corpus.db")
+        conn = store.db
+        try:
+            conn.execute(
+                "INSERT INTO families (name, recheck_days, focus) VALUES ('general', 30, 'public notes')"
+            )
+            conn.execute("INSERT INTO domains (domain) VALUES ('example.edu')")
+            conn.execute(
+                """
+                INSERT INTO pages (
+                    canon_url, domain, status, next_check_at, interval_sec,
+                    discovered_via, created_at, raw_path
+                ) VALUES (
+                    'https://example.edu/quoted', 'example.edu', 'fetched', 1, 86400,
+                    'seed', 1, 'raw/2018-06-01/quoted.txt'
+                )
+                """
+            )
+            page_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+            conn.execute(
+                """
+                INSERT INTO source_snapshots (
+                    id, page_id, content_hash, retrieved_at, text_path, original_raw_path,
+                    visibility, provenance
+                ) VALUES (1, ?, 'hash-quoted', 1, 'raw/2018-06-01/quoted.txt',
+                          'raw/2018-06-01/original.bin', 'public', 'public_fetch')
+                """,
+                (page_id,),
+            )
+            conn.execute(
+                """
+                INSERT INTO observations (
+                    snapshot_id, page_id, field_key, value_json, subject_json, quote,
+                    quote_start, quote_end, extractor_model, prompt_version, assurance, created_at
+                ) VALUES (
+                    1, ?, 'stipend', '{"amount":"unknown"}', '{}', ?, 0, ?,
+                    'fixture', 'v1', 'review_pending', 1
+                )
+                """,
+                (page_id, quoted, len(quoted)),
+            )
+            for key, deadline, status, wiki_path in (
+                ("old", "2020-01-01", "new", "wiki/entities/note.md"),
+                ("live", "2026-12-01", "new", None),
+                ("done", "2019-01-01", "expired", None),
+            ):
+                conn.execute(
+                    """
+                    INSERT INTO entities (
+                        key, name, norm_name, kind, family, deadline, eligibility,
+                        evidence_quote, evidence_page_id, first_seen_at, last_seen_at,
+                        status, wiki_path
+                    ) VALUES (?, ?, ?, 'fellowship', 'general', ?, 'unknown', ?, ?, 1, 1, ?, ?)
+                    """,
+                    (key, key, key, deadline, quoted, page_id, status, wiki_path),
+                )
+            conn.execute(
+                """
+                INSERT INTO wiki_regions (path, region_key, provenance, body)
+                VALUES ('wiki/entities/note.md', 'human_text', 'human_note', ?)
+                """,
+                (f"{human}\n{verbatim}\n",),
+            )
+            conn.execute(
+                """
+                INSERT INTO wiki_regions (path, region_key, provenance, body)
+                VALUES ('wiki/entities/note.md', 'facts', 'source_evidence', ?)
+                """,
+                ("Code-owned fact: synthetic tuition note.\n",),
+            )
+            backup_dir = root / "data" / "backup"
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            removed_name = "snowball-2019-01-01.db"
+            kept_names = [f"snowball-2024-0{index}-01.db" for index in range(1, 8)]
+            for name in [removed_name, *kept_names]:
+                (backup_dir / name).write_bytes(b"legacy-backup")
+            stats = retention.run_retention(conn, root_dir=root, now_dt=now)
+            self.assertFalse((root / "raw" / "2026-09-23").exists())
+            self.assertFalse(loose_path.exists())
+            self.assertEqual(quoted_path.read_text(encoding="utf-8"), quoted)
+            self.assertEqual(original_path.read_bytes(), b"original-bytes")
+            self.assertTrue((root / "raw" / "2026-09-24" / "edge.txt").is_file())
+            self.assertTrue((root / "raw" / "2026-10-01" / "new.txt").is_file())
+            self.assertFalse(old_file.exists())
+            self.assertFalse(old_log.exists())
+            self.assertTrue(new_file.is_file())
+            self.assertTrue(new_log.is_file())
+            self.assertEqual(note.read_bytes(), note_bytes)
+            self.assertEqual(digest_page.read_text(encoding="utf-8"), "keep digest")
+            self.assertEqual(stats["quick_check"], "ok")
+            self.assertEqual(stats["backups"], 1)
+            self.assertEqual(stats["expired"], 1)
+            self.assertFalse((backup_dir / removed_name).exists())
+            self.assertEqual(
+                sorted(path.name for path in backup_dir.glob("snowball-*.db")),
+                kept_names,
+            )
+            self.assertEqual(
+                conn.execute("SELECT status FROM entities WHERE key = 'old'").fetchone()[0],
+                "expired",
+            )
+            self.assertEqual(
+                conn.execute("SELECT status FROM entities WHERE key = 'live'").fetchone()[0],
+                "new",
+            )
+            self.assertEqual(
+                conn.execute("SELECT status FROM entities WHERE key = 'done'").fetchone()[0],
+                "expired",
+            )
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0], 3)
+            self.assertEqual(
+                conn.execute("SELECT value_json FROM observations").fetchone()[0],
+                '{"amount":"unknown"}',
+            )
+            bundle = Path(stats["backup_path"])
+            self.assertTrue(bundle.is_dir())
+            self.assertTrue((bundle / "manifest.json").is_file())
+            self.assertTrue((bundle / "database.db").is_file())
+            manifest = migration.verify_bundle(bundle)
+            bundled = {entry["path"] for entry in manifest["files"]}
+            self.assertIn("raw/2018-06-01/quoted.txt", bundled)
+            self.assertIn("raw/2018-06-01/original.bin", bundled)
+            self.assertIn("wiki/entities/note.md", bundled)
+            self.assertNotIn("raw/2018-06-01/loose.txt", bundled)
+            self.assertNotIn("raw/2026-09-23/old.txt", bundled)
+            self.assertEqual(
+                (bundle / "files" / "wiki" / "entities" / "note.md").read_bytes(),
+                note_bytes,
+            )
+        finally:
+            conn.close()
+
+        restored_root = root / "isolated"
+        restored_db = restored_root / "data" / "corpus.db"
+        restored = migration.restore_bundle(bundle, restored_db, restored_root)
+        self.assertEqual(restored["quick_check"], "ok")
+        restored_note = restored_root / "wiki" / "entities" / "note.md"
+        self.assertEqual(restored_note.read_bytes(), note_bytes)
         self.assertEqual(
-            conn.execute("SELECT status FROM entities WHERE key = 'old'").fetchone()[0],
-            "expired",
+            (restored_root / "raw" / "2018-06-01" / "quoted.txt").read_text(encoding="utf-8"),
+            quoted,
         )
         self.assertEqual(
-            conn.execute("SELECT status FROM entities WHERE key = 'live'").fetchone()[0],
-            "new",
+            (restored_root / "raw" / "2018-06-01" / "original.bin").read_bytes(),
+            b"original-bytes",
         )
-        self.assertEqual(conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0], 3)
-        conn.close()
-
-    def test_restore_backup_and_eight_copies(self):
-        tmp = tempfile.TemporaryDirectory(prefix="snowball-backup-test-")
-        self.addCleanup(tmp.cleanup)
-        root = Path(tmp.name)
-        backup_dir = root / "backups"
-        backup_dir.mkdir(parents=True)
-        for i in range(1, 9):
-            (backup_dir / f"snowball-2026-01-{i:02d}.db").write_text("backup-data", encoding="utf-8")
-        kept, pruned = retention._trim_backups(backup_dir, keep=7)
-        self.assertEqual(kept, 7)
-        self.assertEqual(pruned, 1)
-        remaining = sorted(p.name for p in backup_dir.glob("snowball-*.db"))
-        self.assertEqual(len(remaining), 7)
-        self.assertNotIn("snowball-2026-01-01.db", remaining)
-        self.assertIn("snowball-2026-01-08.db", remaining)
-
-        db_path = root / "source.db"
-        conn = sqlite3.connect(db_path)
-        conn.execute("CREATE TABLE entities (key TEXT PRIMARY KEY, name TEXT)")
-        conn.execute("INSERT INTO entities VALUES ('e1', 'Entity 1')")
-        conn.execute("CREATE TABLE pages (id INTEGER PRIMARY KEY, canon_url TEXT)")
-        conn.execute("INSERT INTO pages VALUES (1, 'https://example.com')")
-        conn.commit()
-        conn.close()
-
-        restored_db = root / "restored" / "snowball.db"
-        stats = retention.restore_backup(db_path, restored_db)
-        self.assertTrue(restored_db.is_file())
-        self.assertEqual(stats["quick_check"], "ok")
-        self.assertEqual(stats["entities"], 1)
-        self.assertEqual(stats["pages"], 1)
-        with self.assertRaises(ValueError):
-            retention.restore_backup(db_path, db_path)
+        db = sqlite3.connect(restored_db)
+        try:
+            self.assertEqual(db.execute("PRAGMA quick_check").fetchone()[0], "ok")
+            self.assertIsNone(db.execute("PRAGMA foreign_key_check").fetchone())
+            text_path = Path(db.execute("SELECT text_path FROM source_snapshots").fetchone()[0])
+            original = Path(db.execute("SELECT original_raw_path FROM source_snapshots").fetchone()[0])
+            self.assertTrue(text_path.is_relative_to(restored_root))
+            self.assertTrue(original.is_relative_to(restored_root))
+            start, end = db.execute("SELECT quote_start, quote_end FROM observations").fetchone()
+            self.assertEqual(text_path.read_text(encoding="utf-8")[start:end], quoted)
+            self.assertEqual(original.read_bytes(), b"original-bytes")
+            self.assertEqual(
+                db.execute("SELECT status FROM entities WHERE key = 'old'").fetchone()[0],
+                "new",
+            )
+            self.assertEqual(
+                db.execute("SELECT status FROM entities WHERE key = 'live'").fetchone()[0],
+                "new",
+            )
+            self.assertEqual(
+                db.execute("SELECT status FROM entities WHERE key = 'done'").fetchone()[0],
+                "expired",
+            )
+            regions = db.execute("SELECT provenance, body FROM wiki_regions").fetchall()
+            self.assertTrue(any(
+                row[0] == "human_note" and human in row[1] and verbatim in row[1] for row in regions
+            ))
+            self.assertFalse(any(row[0] == "source_evidence" and human in row[1] for row in regions))
+        finally:
+            db.close()
+        extra = "\nExtra human edit.\n"
+        restored_note.write_bytes(restored_note.read_bytes() + extra.encode("utf-8"))
+        with self.assertRaises((ValueError, RuntimeError)):
+            migration.restore_bundle(bundle, restored_db, restored_root)
+        self.assertIn("Extra human edit.", restored_note.read_text(encoding="utf-8"))
+        self.assertEqual(note.read_bytes(), note_bytes)
 
 
 class TestFeedback(unittest.TestCase):

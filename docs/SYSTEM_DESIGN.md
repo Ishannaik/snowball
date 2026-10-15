@@ -1,9 +1,9 @@
 # Snowball System Design Specification
 
-**Version:** 1.1 (access amendment and gate-evidence policy)
-**Date:** 2026-10-08
+**Version:** 1.1 (access amendment and gate-evidence policy), plus the 2026-10-10 goal-harness amendment in sections 1.6, 5.5, 6.10, and 7.5
+**Date:** 2026-10-08; goal-harness amendment 2026-10-10
 **Repo:** `github.com/Ishannaik/snowball` (private), checkout at `~/repos/snowball`
-**Supersedes:** `DESIGN.md` (crawl tree, v0). `PLAN.md` remains the feature list and now points at this amendment.
+**Supersedes:** `DESIGN.md` (crawl tree, v0). `PLAN.md` remains the legacy feature list and points at the goal-harness plan. Harness scenarios G01–G30 are not ledger rows in this amendment.
 **Gate status:** section 9.1 and `data/gate-evidence.jsonl`. A verified ledger row is the only completion record for a gate.
 **Inputs:** the v0 fork, the 8-agent competitor audit in `COMPETITOR_DEEP_DIVE.md` and `FEATURE_MATRIX.md`, and the host facts measured on 2026-10-06 (goku: aarch64, 4 cores, 11.8 GB available RAM, 84 GB free disk, SQLite 3.45.1; oracle: SQLite 3.45.1, curl_cffi 0.15.0 with `CurlOpt.RESOLVE`, default impersonation profile `chrome146`). Those free-memory and free-disk figures are historical measurements, not deployment evidence. Measure the host again at deployment.
 
@@ -12,11 +12,14 @@
 ## Table of contents
 
 1. [Executive summary and foundational invariants](#1-executive-summary-and-foundational-invariants)
+   - [1.6 Goal control plane](#16-goal-control-plane)
 2. [End-to-end system architecture](#2-end-to-end-system-architecture)
 3. [The 5-layer deterministic no-repeat lock engine](#3-the-5-layer-deterministic-no-repeat-lock-engine)
 4. [The 3-tier scraper waterfall and pluggable anti-ban design](#4-the-3-tier-scraper-waterfall-and-pluggable-anti-ban-design)
 5. [SQLite schema](#5-sqlite-schema)
+   - [5.5 Schema version 4](#55-schema-version-4)
 6. [Multi-subagent orchestration topology](#6-multi-subagent-orchestration-topology)
+   - [6.10 Goal gate and outcomes](#610-goal-gate-and-outcomes)
 7. [Safety, egress and anti-hallucination pipeline](#7-safety-egress-and-anti-hallucination-pipeline)
 8. [Knowledge base and incremental wiki compiler](#8-knowledge-base-and-incremental-wiki-compiler)
 9. [Milestone roadmap M0 to M4](#9-milestone-roadmap-m0-to-m4)
@@ -32,6 +35,8 @@
 ### 1.1 What Snowball is
 
 Snowball is a research agent that runs 24 hours a day on the `goku` VPS. It builds and maintains its own knowledge base: a Markdown wiki that is the source of truth, plus a SQLite database that holds the crawl frontier, the no-repeat locks and a rebuildable full-text index. It looks for grants, hackathons, startup funding, free GPU and cloud credits, competitor moves and early "alpha" about AI tools. Nobody approves its work. Once a day it posts a Discord digest that contains only what is new or changed since the last digest. Managed fetching, residential proxies, and CAPTCHA solving are outside the default loop. Section 4 states when an operator may activate them for authorized public pages. Writing that code is feature implementation. Calling a provider is a separate activation step.
+
+Historical deployment picture, measured for the 2026-10-08 writeup. The goku-only 24-hour loop, the "nobody approves its work" sentence, and the claim that Oracle holds no Snowball state describe that lead crawler. The current operator layout, including the Oracle checkout and `data/highered.db`, is in README Oracle Deployment. That section keeps `snowball-loop.service` disabled and does not record a goal-harness rollout. Section 1.6 is the control plane now being implemented.
 
 ### 1.2 The problem it solves
 
@@ -57,13 +62,13 @@ These hold at every milestone. A change that breaks one is a design change, not 
 
 | # | Invariant | Enforced by |
 |---|---|---|
-| I1 | **Code seeds, the web supplies.** After day one, every query in `queries` has a `discovered_via` of `hub`, `name`, `backlink` or `similar`, never `llm`. | `queries.discovered_via` CHECK constraint, section 5 |
+| I1 | **Code seeds, the web supplies facts.** A model may propose a search hypothesis or a fetch of a URL already seen for this goal. Code validates public scope and provenance, deduplicates, checks access policy, and reserves a finite budget. `hypothesis` and code-generated `gap` are scheduling provenance, never evidence. Only a source-backed reviewed observation supports current qualification. The legacy lead rule remains: after day one, lead-crawler queries use `discovered_via` of `hub`, `name`, `backlink`, or `similar`. | Section 1.6, planner validation, section 5 |
 | I2 | **The LLM never judges novelty.** New / changed / same is decided by the lock engine before any model sees the item. | Section 3 pipeline order |
-| I3 | **The model has no tools.** Text in, JSON out. Code fetches, code writes. Nothing a page says can execute. | `tools/llm.py`, section 6.5 |
+| I3 | **The model has no tools.** Text in, JSON out. Code fetches, code writes. Nothing a page says can execute. | `tools/prompts.py` and `tools/engine_transport.py` for harness calls; `tools/llm.py` on the historical lead path; section 6.5 |
 | I4 | **Authorized public access only.** Configured managed fetch, a residential proxy, and a CAPTCHA provider may retrieve operator-approved public research pages. Escalation is domain-scoped, cost-capped, and time-bounded. A login wall, paywall, robots exclusion, explicit access denial, or rate-limit ban is terminal or a cooldown, not a reason to rotate identity or keep paying. Feature implementation does not activate a provider: paid execution stays off until credentials, a current tariff, nonzero ceilings, and an `access.yml` allowlist all exist. Shipped secret-free configuration keeps paid ceilings at zero. A missing prerequisite is `blocked`. | Section 4 |
 | I5 | **Every extracted fact carries an evidence quote found verbatim in the fetched page.** A fact without a passing quote is dropped, not softened. | Section 7.4 |
 | I6 | **Re-check means diff, not redo.** A due page is re-fetched, hashed, and only its new rows enter the pipeline. | Section 3.2, 4.6 |
-| I7 | **Markdown is truth, SQLite indexes are rebuildable.** `wiki/` can rebuild `wiki_*` tables and FTS5 at any time. The frontier and lock tables are authoritative and backed up. | Section 8.1 |
+| I7 | **SQLite holds the frontier, locks, goals, snapshots, and evaluations. Markdown holds human-edited regions and rendered views.** `wiki/` can rebuild `wiki_*` tables and FTS5. SQL goals, snapshots, and evaluations cannot be recreated from summaries. The frontier and lock tables stay backed up with the v4 corpus bundle (section 5.5). | Section 8.1, section 5.5 |
 | I8 | **Budgets sleep, they never fail.** Exa reserve, token budget, per-domain rate, paid fetch cap and memory cap all pause work and resume when the window opens. | Section 6.4 |
 | I9 | **Zero PyTorch, zero FAISS, no headless browser on the default fetch path.** Pure Python, SQLite FTS5, BM25 and TF-IDF do the ranking. A separate one-context challenge worker is outside that path and stays off until provider activation. | Section 7.3, 3.5, 4.1 |
 | I10 | **Only new or changed reaches a human.** A digest line is an `entities` row with `reported_at IS NULL`, or an `entity_changes` row with `reported_at IS NULL`, and nothing else. | Section 8.6 |
@@ -76,7 +81,61 @@ These hold at every milestone. A change that breaks one is a design change, not 
 - No acting on findings: Snowball never applies, posts, purchases, or emails.
 - No per-page approval queue. Domain policy is operator configuration, not a queue. Human feedback is optional and only adjusts scores.
 - Private topics stay on local models. They never use an external paid fetcher, a solver, or a public model endpoint.
-- No treating a green unit suite, a fixture file, an empty result, a missing provider key, or an existing git tag as completion of the Fable gates. Section 9.1 is the status rule.
+- No treating a green unit suite, a fixture file, an empty result, a missing provider key, or an existing git tag as completion of the Fable gates. Section 9.1 is the status rule. Harness scenarios G01–G30 are a separate matrix in the goal-harness spec. This amendment does not record them as passed.
+
+### 1.6 Goal control plane
+
+Sections 1.1 through 6.9 describe the legacy lead crawler: topic seeds, no contract, and a model that does not propose queries. The harness above that crawler admits a wave only when `runnable_goal` finds one goal in `running` or `monitoring`, an approved current contract, and an active execution grant for that contract version and mode, inside its time window, with ledger headroom.
+
+Goal states are `draft`, `needs_information`, `contract_proposed`, `approved`, `running`, `pausing`, `paused`, `revising`, `research_ready`, `monitoring`, and `stopped`. Approval stores the hash you reviewed, covering the contract body and the frozen profile snapshot. A later draft edit does not change that version. `grant` is a separate write from `start`. Replacing a grant keeps settled and lost lifetime usage.
+
+Interview functions in `tools/interview.py` are `build_contract`, `next_question`, `validate_answer`, `question_for`, and `compile_public_frame`. Questions are code-owned. Status `known` and provenance `user_confirmed` are written only from an interview answer with confirm true. A declined confirmation stores `draft` / `user_stated`. `imported_history` and `system_default` stay unconfirmed. Propose stores the full profile snapshot, and `body_hash` is SHA-256 of canonical `{"body", "profile_snapshot"}`. That snapshot keeps unknown and unconfirmed private rows with their real status, provenance, and visibility. The body requires confirmed public material and an explicit `consent_private_evaluation`. Empty `scope.regions` stays unconfirmed until `scope_broad_acknowledged` is explicitly true. Empty is never worldwide, and the interview does not fill a default nationality or cash amount. Consent false allows bounded public research while private eligibility stays missing or unconfirmed. `next_question` does not then require `max_upfront_cash`. Consent true asks for those private fields and still does not store an unanswered limit as zero. `compile_public_frame` projects only whitelisted confirmed `public_ok` values and copies degree level and modality from those answers. Private amounts, citizenship, credentials, and hashes stay out of the frame. Unknown private criteria stay `unknown` and block `CompletionStatus.ready`. Private evaluation is not scheduled until consent is confirmed true.
+
+I1 for this harness: code seeds facts and the web supplies quotes. A model may propose a search hypothesis or a fetch of a URL this goal has already seen. Code checks public scope, provenance, access policy, and a finite reservation. `hypothesis` and code-generated `gap` schedule work. They are not evidence. Only a source-backed reviewed observation supports current qualification. The lead-crawler query classes `hub`, `name`, `backlink`, and `similar` remain the legacy rule.
+
+Four prompt layers:
+
+| Layer | Owner | Cloud call |
+|---|---|---|
+| System policy | `tools/prompts.py`, static | Every public call |
+| Goal contract | `goal_contracts` body and frozen profile snapshot | Never. The public frame is a separate projection and has its own hash. |
+| Strategy | `strategies` | The plan call receives a compact public coverage summary only. |
+| Compiled task | `compile_extract_fields`, `compile_review_observations`, `compile_plan_hypotheses` | System policy, task section, public frame, fenced public source |
+
+The public source type is `prompts.PublicSourceSnapshot(id, url, title, text, content_hash, source_cycle_label=None, applicability={}, visibility='public', provenance='public_fetch')`. `validate_public_request` checks provenance and visibility before a public prompt is compiled. Page id and owner-private binding metadata stay outside that dataclass. `interview.PublicFrame` is the frame type. `prompts.PublicFrame` resolves to it. A raw page string is not an extract entry point. `tools/eval_gates.py` `eval_extract` still calls `extract_page_entities(source_text=, url=)`, and that call raises `TypeError`.
+
+
+Public engines live in `tools/engine_transport.py`: `GeminiBulkExtractor`, `ReviewEngine`, `LocalPrivateEngine`, and `EngineReply`. Each constructor is `(cfg, dry=False)` and holds `cfg` and `dry` only. `available()` returns `(ok, reason)`. `diagnostics()` returns the role status. `dry=True` makes no network call.
+
+Engine methods:
+
+- `GeminiBulkExtractor.extract(frame, program, field_keys, source, binding, operation_key, max_out)`
+- `ReviewEngine.review(frame, observations, source, binding, operation_key, max_out)`
+- `ReviewEngine.plan(frame, public_summary, exploration_budget, binding, operation_key, max_out)` with `exploration_budget` an int
+- `LocalPrivateEngine.private_eval(task, evidence, binding, operation_key, max_out)` for a bound harness task
+
+`source` on extract and review is `prompts.PublicSourceSnapshot`. Extract `program` is only `program_key`, `name`, `institution`, `official_domain`, `degree_level`, `modality`, and `field_tags`. `field_keys` is a separate list and must not be a key inside `program`. Review takes `observations` and that snapshot. It does not take `program` or `field_keys`. Extract and review binding is exactly `goal_id`, `contract_version`, `strategy_version`, `epoch`, and `task_id`, each an int. The orchestrator strips every other key before those calls.
+
+`planner.planner_proposals` calls `plan` with that integer budget. `EngineReply` carries `text`, `tokens_in`, `tokens_out`, `model`, `requested_model`, `reported_model`, `transport`, `usage_kind`, and `model_call` (prompt version, frame hash, source ids, usage split). Direct Gemini replies with parsed provider usage are `actual`. Oracle OMP and AGY replies are `estimated` unless `adapter_conformance` attests that exact URL. Unparsed usage is `unknown`. Those labels are not a provider invoice cap. There is no `GrokAdversarialVerifier` class and no `LocalOrnithFallback` class. Wiki ask looks for `LocalPrivateEngine.interpret(prompt, max_out=1024)` and does not send that prompt through `private_eval`. The class currently defines `private_eval` only, so ask returns `private_engine_unavailable` until `interpret` exists. Neither path uses a public model.
+
+| Role | Class | Oracle model id |
+|---|---|---|
+| extract | `GeminiBulkExtractor` | `agy-pool/gemini-3.8-flash` |
+| review | `ReviewEngine` | `agy-pool/claude-sonnet-4-6` |
+| plan | `ReviewEngine` | `agy-pool/claude-sonnet-4-6` |
+| `private_eval` | `LocalPrivateEngine` | `private_model_id` on an attested `private_model_endpoint`. Leave the endpoint unset until isolation is attested |
+
+`http://127.0.0.1:8088/v1` is the AGY cloud proxy. Loopback does not make that process local inference. `GROK_X_*` remains X post acquisition only.
+
+Frontier admission is `planner.gap_proposals(store, goal, coverage)`, `planner.validate_proposals(store, goal, proposals)`, `planner.planner_proposals(engine, frame, coverage, budget)`, and `planner.schedule(store, goal, validated, wave_id)`. `schedule` reserves through `ledger.reserve_batch`. It does not call `admit_node`, and it does not import a `snowball_locks` module. Extract and review binding is exactly `goal_id`, `contract_version`, `strategy_version`, `epoch`, and `task_id`. Ledger `reserve_batch` requires `goal_id`, `contract_version`, `strategy_version`, and `epoch`. A node reservation also carries `node_kind`, `node_key`, `phase`, and `depth`. A domain reservation also carries `domain`, `task_id`, `lease_token`, and `lease_until`. Model-token reservations may add `role` and `shared_day_limits`. Those ledger fields do not go to the public engine. `binding_valid(db, goal_id, contract_version, strategy_version, epoch)` takes the open connection. It is true for `running` or `monitoring` when the epoch matches, the named contract is the current approved version, and that strategy row exists. An older strategy on the same epoch stays valid. `reserve_batch(store, grant_id, operation_key, amounts, binding)` is the only atomic reserve and calls `binding_valid`. `mark_dispatched(store, operation_key, goal_id)` is a separate fenced step and succeeds once. The orchestrator calls both for extract, review, and plan token amounts on that same ledger. `LockEngine` in `tools/orchestrator.py` still owns `query_lock(db, raw, source, recheck_days, topic_id, via)` and `enqueue_url(db, raw, topic_id, via, recheck_days)`.
+
+`goal.validate_limits` accepts grant `exploration_share` as an integer or a canonical decimal string inside the approved policy ceiling. It rejects a boolean and a JSON float such as `0.3`. The policy ceiling itself may be a finite float in `0..1`. `exploration_budget` on `plan` is a separate nonnegative integer. `ledger.reserve_batch` accepts a stored share that is an integer, a finite float from 0 to 1, or a canonical decimal string, and it rejects `usage_mode` `hard`. `goal grant` calls `validate_limits` before insert, so the grant file uses the integer or the string. The orchestrator does not rewrite the share.
+
+`completion_status` returns `CompletionStatus`. `ready` is true only for the positive predicate: enough current matching packages, reviewed support, unknown never counted as met, and conditional staying conditional. A private criterion left unknown, including when consent is false, stays `unknown` (`consent_required` on the private matchers) and keeps the package out of the ready count. `detail` is a dict of reasons and package outcomes, not a status token. The substates this function returns are only `partial_coverage`, `verifier_unavailable` (the reviewer is unavailable; this is not the `review_pending` assurance), `no_match`, and `research_ready`. The worker writes the `research_ready` goal state only when that predicate passes. You do not set it from the CLI. Qualification does not start monitoring and does not record admission or a funding award. Assurance levels are in section 7.5. Rows with provenance `legacy_v3` stay historical leads.
+
+`snowball.py serve` execs `tools/console.py` with `--db`, `--host`, and `--port`. `snowball.py console` forwards the remainder to `tools/console.py`. `tools/visualize.py` is the terminal view. It is not the console server. Console read routes do not migrate. `status` and `--dry-run` call `Store.connect_existing` and do not call `migrate`. `status` opens the selected database read-only. `--dry-run` copies it in memory and writes nothing back to that file.
+
+This section is the implementation contract. It is not evidence that G01–G30 passed, it does not record a production deployment, and it does not enable `snowball-loop.service`. Snowball does not install a periodic Gemini hook. A public-only Gemini pass in the build workflow is outside this runtime. Design scenarios O01–O03 stay not exercised until you approve a goal, a grant, and a bounded live smoke.
 
 ---
 
@@ -129,7 +188,7 @@ These hold at every milestone. A change that breaks one is a design change, not 
                        direct HTTPS via curl_cffi · optional ZenRows / residential proxy (opt-in)
 ```
 
-The diagram is the free path plus Oracle's model and Exa services. Managed fetch, residential proxy, and the challenge worker are specified in section 4. Code for those routes is feature implementation. Provider activation is separate: credentials, a current tariff, nonzero ceilings, and an `access.yml` allowlist. Historical RAM and disk figures in the diagram and the header are measurements from 2026-10-06, not deployment evidence. Production state stays on goku. Oracle supplies model and Exa services and does not hold Snowball state. Verify usable model IDs at deployment. Do not swap in a paid GPU alias to force a smoke pass.
+The diagram is the historical goku lead-crawler layout measured on 2026-10-06: host size, the SSH tunnel, Ornith, Qwen, Gemma, and the line that Oracle holds no Snowball state. Those host figures, the 2,000,000 token guard in section 6.4, and a later 32,000,000 process default are historical ceilings. They are not the Oracle estimated caps in the README, and they are not a hard provider-token limit. Current engines and model ids are section 1.6. Operator steps are README Oracle Deployment. Managed fetch, residential proxy, and the challenge worker are specified in section 4. Writing that code is feature implementation. Provider activation is separate: credentials, a current tariff, nonzero ceilings, and an `access.yml` allowlist. Do not swap in a paid GPU alias to force a smoke pass.
 
 Private topics stay on local models. They never use an external paid fetcher, a solver, or a public model endpoint.
 
@@ -175,7 +234,7 @@ Access policy (`access.yml`, module planned as `tools/access_policy.py` under ta
 ```
 ~/repos/snowball/
   snowball/              Python package (stdlib + curl_cffi + trafilatura + pyyaml + aiohttp)
-  data/snowball.db       authoritative DB (WAL). Nightly `VACUUM INTO data/backup/snowball-YYYY-MM-DD.db`, keep 7
+  data/snowball.db       authoritative DB (WAL). Retention writes the section 5.5 bundle. A dated `snowball-YYYY-MM-DD.db` file is historical
   raw/YYYY-MM-DD/        extracted text per fetch, 14-day retention
   wiki/                  Markdown truth, git-committed after each wave
     entities/<slug>.md   one per entity key
@@ -191,11 +250,15 @@ Access policy (`access.yml`, module planned as `tools/access_policy.py` under ta
   STOP                   touch to pause the supervisor between waves
 ```
 
+This tree is the historical goku checkout. The Oracle console checkout is `/home/ubuntu/repos/snowball` with database `data/highered.db`. A v4 cutover bundle is `database.db`, `manifest.json`, and `files/` with SHA-256 of referenced raw bytes and human-edited wiki markdown (section 5.5). A dated DB-only `snowball-YYYY-MM-DD.db` file is historical and is not that bundle. `STOP` still pauses the supervisor between waves and does not change goal state (section 6.10).
+
 ### 2.5 Network
 
 - All LLM and Exa traffic leaves goku through one SSH tunnel to oracle, kept alive by `snowball-llm-tunnel.service` (`ssh -N -o ServerAliveInterval=30 -o ExitOnForwardFailure=yes -L 127.0.0.1:8812:127.0.0.1:8812 -L 127.0.0.1:8791:127.0.0.1:8791 oracle-a1`, `Restart=always`). Nothing on oracle changes, and the proxy keeps listening on localhost only. Re-check that mapping at deployment. A historical listener address is not proof the tunnel is up.
 - `100.64.0.0/10` (the Tailscale CGNAT range) is in the SSRF deny list, so a crawled link can never reach a tailnet peer. The same deny list covers the browser egress gateway when that worker is activated. Local DNS pinning does not cover a remote provider's own resolver.
 - Outbound crawl traffic uses goku's own IP. There is no proxy unless provider activation for an approved public origin is in effect (section 4.5).
+
+The three bullets above are the historical goku tunnel. They say Oracle does not change and that Snowball state stays off Oracle. The current console is tailnet-only at `https://snowball.ishannaik.com/`. Caddy binds `100.68.165.73:443` and forwards to `127.0.0.1:8989`, rewriting `Host` to `127.0.0.1:8989`. The browser `Origin` remains `https://snowball.ishannaik.com`. `http://127.0.0.1:8088/v1` is the AGY cloud proxy, not local inference. Operator steps are in README Oracle Deployment.
 
 ---
 
@@ -1157,9 +1220,40 @@ SELECT id, domain, novelty * value * due AS score FROM cand ORDER BY score DESC 
 
 ### 5.4 Backups and integrity
 
-- Nightly `VACUUM INTO 'data/backup/snowball-<date>.db'`, keep 7, from `snowball-retention.timer`.
+- Historical: nightly `VACUUM INTO 'data/backup/snowball-<date>.db'`, keep 7. That dated DB-only file is no longer written.
+- Current retention writes the section 5.5 bundle. It does not write a new `snowball-YYYY-MM-DD.db`. It still deletes surplus existing `snowball-*.db` files down to `--keep` (default 7). Those old files are not the v4 rollback bundle.
 - `PRAGMA quick_check` weekly; a failure stops the supervisor and posts to Discord.
 - `wiki/` is a git repository committed after each wave (`git add wiki digests && git commit -qm "wave <id>: +N entities, M changes"`), so the truth layer has history independent of the DB.
+
+The dated `VACUUM INTO` file was a database snapshot. It did not preserve `raw/` or human-edited wiki pages. The operator rollback bundle does (section 5.5).
+
+### 5.5 Schema version 4
+
+The amendment list called this "section 5.2". The existing section 5.2 is the frontier state machine, so the schema contract is recorded here.
+
+Current schema version is 4. `python snowball.py migrate --db PATH --bundle-root DIR` execs `tools/migration_cli.py`, which calls `Store.migrate` and prints JSON. `--json` only changes compact versus indented JSON. It does not call `status` or `serve`. Exit 2 prints only `{"error":"migration_blocked","kind","detail"}` and does not advance `schema_version`. `status`, `serve`, and `goal show` refuse an old schema and do not migrate.
+
+The database parent directory is named `data`. The storage root is the parent of `data`. Stop other Snowball processes first.
+
+A missing path does not call `migration.migrate`. `Store.open` calls `init_schema`, which calls `migration.initialize` and creates a fresh v4 database. The JSON is `schema_version` 4, `changed` true, `bundle` null, and `fresh` true.
+
+An existing v2 or v3 file calls `migration.migrate`. The JSON is `schema_version` 4, `changed` true, `bundle` set to the directory, and `quick_check` `"ok"`. `create_bundle` returns only after `database.db`, `manifest.json`, and `files/` verify. That directory name is `goal-v{2|3}-{unix}-{8 hex}`. The schema transaction starts only after `create_bundle` returns. The live file becomes version 4 only after `foreign_key_check` and `quick_check` pass in the transaction. Foreign keys are off only for the rebuild transaction and are turned back on afterwards. `migration.migrate` does not upgrade a missing file.
+
+Both failures below print only `{"error":"migration_blocked","kind","detail"}` and exit 2. That JSON does not include the bundle path.
+
+A failure inside `create_bundle`, before it returns, deletes the incomplete directory. Its absence means the bundle was removed. It does not mean migrate never started.
+
+A failure after `create_bundle` returns, during the schema transaction, rolls that transaction back. `schema_version` stays unchanged. The verified `goal-v{2|3}-{unix}-{8 hex}` directory stays under the bundle root. The operator finds it there by that name, because the error JSON does not print the path. Keep it. Do not start `serve` on a migrate that did not finish.
+
+Malformed `schema_version`, an absent version, schema 0, and any version other than 2, 3, or 4 raise `MigrationRequired` before a bundle and before table creation. A v4 file missing `goals`, `source_snapshots`, or `observations` raises `MigrationRequired` and does not create those tables. A second run on a complete v4 database returns `schema_version` 4, `changed` false, and `bundle` null, with no `quick_check` field and no second bundle.
+
+Rollback is `python snowball.py retention --restore data/backup/goal-v3-UNIX-HEX --root restore-root --db restore-root/data/highered.db`. Replace the bundle directory with the `goal-v*` directory left under the backup root. `--restore` is that verified bundle, not a dated SQLite snapshot. `--db` must sit inside a new `--root` that does not exist yet. That calls `restore_bundle(bundle, target_db, target_root)`. Restore checks checksums, stages the tree, and publishes it by rename. It refuses an existing root, a symlink or Windows reparse point, and any path that escapes the new root or the original storage root. Failure leaves the target absent and the live corpus unchanged. Retention does not write a new `snowball-YYYY-MM-DD.db`. `_trim_backups` still deletes surplus pre-existing `snowball-*.db` files down to `--keep` (default 7). Those old files are not the v4 rollback bundle.
+
+`goal new` on a missing path creates a fresh v4 database. On an existing v2 or v3 file it refuses and does not upgrade that file.
+
+Migration adds the goal tables in `tools/goal_schema.py`: `goals`, `goal_contracts`, `profile_fields`, `interview_sessions`, `interview_turns`, `execution_grants`, `strategies`, `goal_events`, `frontier_decisions`, `resource_ledger`, `resource_reservations`, `resource_operations`, `programs`, `source_snapshots`, `observations`, `funding_packages`, `constraint_evaluations`, `contradictions`, `fx_rates`, `goal_topics`, `goal_pages`, `goal_queries`, `goal_programs`, `goal_node_identities`, `domain_slots`, `model_calls`, `console_tokens`, `console_sessions`, `console_rates`, `goal_runtime`, `program_field_cooldowns`, and `wiki_regions`. Existing `entities` and `claims` gain provenance defaulting to `legacy_v3`. Those rows stay leads. Nothing in this migration deletes evidence.
+
+`model_calls` records requested and reported model, transport, and `usage_kind` of actual, estimated, or unknown. Historical grok spend stays unknown usage. It is not rewritten as Claude.
 
 ---
 
@@ -1266,6 +1360,8 @@ When the pop returns fewer than 4 due pages, in order: (1) Exa `findSimilar` on 
 
 ### 6.9 Supervisor loop
 
+Historical lead-crawler loop. The harness supervisor is section 6.10. This listing does not admit work and it does not enable `snowball-loop.service`.
+
 ```python
 async def main():
     while True:
@@ -1287,6 +1383,22 @@ async def main():
         close_wave(wave)
         await asyncio.sleep(1800 if pops.dry else WAVE_PAUSE_SEC)
 ```
+
+### 6.10 Goal gate and outcomes
+
+`SnowballOrchestrator.supervise(max_topics=1, interval_sec=60, slug_filter=None)` calls `goal_runtime.supervise(cfg, topics_file, dry, **kwargs)`. `dry` is the orchestrator dry flag. `kwargs` carries `max_topics`, `interval_sec`, and `slug_filter`, and `db_path` only when `store.path` is set. The call passes no `stop_file` and no other keyword. `python snowball.py run`, `run-once`, and `supervise` accept `--topic` (a slug), `--max-topics`, `--dry-run` or `--dryrun`, `--mode` `auto` or `gemini-bulk`, `--topics`, `--db`, and `--json`. `seed` accepts `--db`, `--json`, `--topics`, and `--dry-run` or `--dryrun`. It does not accept `--topic`, `--max-topics`, or `--mode`. `status` accepts `--db` and `--json` and does not take `--topic`. There is no `--interval` flag. The worker flag `--supervise` forwards `--max-topics` and `--topic` as `slug_filter`. `interval_sec` stays the method default 60. A read of an existing database does not migrate. Each cycle calls `run`, then reads status. `run` checks `runnable_goal` before seeding, before `select_topics`, and before a manual `--topic` override. The `CAST(strftime('%s','now') AS INTEGER)` comparison inside `select_topics` stays byte for byte. `--topic` may override a topic cooldown. It does not override the goal, the grant, privacy, or page-access checks.
+
+`status` and `run-once --dry-run` do not migrate and do not write the selected database. `--dry-run` copies the database in memory and makes no network or model calls. With no runnable goal the outcome is `no-runnable-goal` plus a reason: `no_goal`, `not_running`, `no_grant`, `grant_expired`, `grant_exhausted`, `goal_paused`, `research_ready`, `mode_mismatch`, or `no_contract`.
+
+Idle sleeps when the supervisor is actually running: `no-runnable-goal` 300 seconds, `goal-paused` 60 seconds, `research_ready` 1800 seconds, `monitoring` until the next due snapshot and at most 1800 seconds. A `STOP` file or `KeyboardInterrupt` returns without writing the goal row. On Oracle the loop unit uses `Restart=always`, so a `STOP` file does not keep a managed process down. Leave `snowball-loop.service` disabled until you approve the actual goal, the actual grant, and a bounded live smoke. This amendment does not enable or start that unit.
+
+Frontier admission is the planner path in section 1.6. `schedule` does not call `admit_node`. A late result may keep raw bytes and conservative usage. It cannot qualify the current goal when `binding_valid` fails for the contract version or epoch. A grant file stores `exploration_share` as an integer or a canonical decimal string. JSON `0.3` fails `goal grant` before reserve. The orchestrator leaves the stored grant unchanged. Estimated OMP usage is not a hard billing cap. `usage_mode` `hard` is rejected.
+
+`status` reports the goal slug and state, contract version, grant expiry, headroom per counter, substate, reason, and review and private-endpoint availability by role and model id, plus the existing frontier counters. Token figures are labelled actual, estimated, or unknown. Historical grok rows stay unknown. Estimated OMP usage is not a hard billing cap. `usage_mode` `hard` is rejected.
+
+`completion_status` returns only `partial_coverage`, `verifier_unavailable`, `no_match`, and `research_ready`. Those names come from the spec 7.5 outcome table. Unknown private criteria, including a declined private-evaluation consent, stay unknown and keep a package out of `research_ready`. `partial_coverage` means the wave finished while some shortlisted programs still have unknown critical fields and no eligible node remains for them today. An empty queue or an exhausted grant is that outcome, not readiness. `verifier_unavailable` means the reviewer is unavailable. The substate is not "pending review". Observations from that outage stay `review_pending` and are not qualified. `no_match` means every candidate has at least one hard constraint unmet at `reviewed_kept`. Zero matches means no matches among the candidates checked. `detail` holds reasons and package outcomes. Qualification does not record admission or a funding award, and it does not start monitoring.
+
+The last strategy outcome while `running` is a separate list: `progressing`, `exhausted`, `partial_coverage`, `outage`, `verifier_unavailable`, `empty_frontier`, `blocked`, `no_match`, `user_stopped`, and `stalled`. `stalled` is an unchanged work and coverage fingerprint. The model does not judge novelty. `research_ready` and `monitoring` in the spec outcome table are goal states. Monitoring starts only from an explicit monitoring grant and a transition to `monitoring`. The worker then refreshes due snapshots for shortlisted programs and otherwise idles.
 
 ---
 
@@ -1455,7 +1567,30 @@ def quote_ok(quote: str, page_text: str) -> tuple[bool, int, int]:
 
 A failing quote drops the row or claim. The page's `noise_count` increments; 5 noise drops on one page mark it `junk`.
 
-**Tier 3, cross-model reject-only check (digest-bound items only):** for each entity about to enter a digest, Qwen 27B is asked, with the source quote and the row, "Does the quote support every field in the row? Answer yes or no and name the unsupported field." LLM judges have agreement bias, so this tier can only **reject** (set `status = known`, `reported_at = -1`, log the field); it can never promote something Tier 2 rejected. Fail-closed: a timeout or malformed answer leaves the item in the digest (Tier 2 already passed) and logs the miss.
+**Tier 3, historical lead crawler:** a second model (then described as Qwen 27B) could reject a digest row and could not promote a row that tier 2 had rejected. The old fail-closed sentence said a timeout or a malformed answer still left the item in the digest because tier 2 had passed. That sentence is withdrawn for goal qualification.
+
+**Assurance levels (replaces that fail-closed digest rule).** Review uses `ReviewEngine` and `agy-pool/claude-sonnet-4-6` on Oracle, over observations, not as a funding guarantee. A missing reviewer, a timeout, or a bad reply does not qualify the field and does not publish it as ready.
+
+| Assurance | When it is stored | Qualifies a critical field |
+|---|---|---|
+| `code_checked` | Quote span and number checks passed. No review keep yet. | No |
+| `reviewed_kept` | Reviewer returned `keep` for that observation. | Only together with the constraint rule below |
+| `reviewed_dropped` | Reviewer returned `drop`, with a reason. | No |
+| `review_pending` | Verdict missing, reply malformed, or reviewer outage. | No |
+| `review_unavailable` | No reviewer is configured. | No |
+
+Per-constraint status, evaluated in code against the frozen profile snapshot:
+
+| Status | Rule |
+|---|---|
+| `met` | Applicable `reviewed_kept` evidence, bound to the program, award, campus, unit, and intake, satisfies the frozen rule. |
+| `unmet` | Supported evidence violates the rule. Missing information is not `unmet`. |
+| `unknown` | Missing applicability, period, review, or an unconfirmed material profile. Unknown is never stored as `met`. |
+| `conditional` | A documented contingency. Explicit acceptance may count the package toward the shortlist and the cell stays conditional. |
+
+Unresolved conflicts between official sources stay `unknown`. The console may show that cell as contested. `contested` is not a stored `constraint_evaluations.status` value.
+
+A mechanical quote check alone never qualifies a critical field. Loans do not satisfy a grant component. `research_ready` is only the positive completion predicate in section 1.6: enough current matching packages, reviewed support, unknown never counted as met, and conditional staying conditional. Reviewer keep is not an admission and not a funding award. Qualification does not start monitoring.
 
 **Deterministic sampling (hyperresearch PR #141):** when a page yields more than 20 claims, the verifier checks all rows and a deterministic subset of claims chosen by `sha1(claim_hash) % 3 == 0` plus every claim with a number. No RNG, so re-runs verify the same subset.
 
@@ -1495,7 +1630,7 @@ Before a digest is sent, every `link` in it gets an async `HEAD`; on 405 or 403 
 
 - `wiki/**/*.md` is the source of truth. It is a git repo. A human can edit it; the next `reindex` picks the edit up.
 - `wiki_pages`, `wiki_links`, `wiki_fts` are a cache. `snowball reindex` drops and rebuilds them from the files in under 60 s at 10,000 pages (FTS5 insert speed on goku measured in M2).
-- The frontier and lock tables are **not** derivable from the wiki and are backed up nightly (section 5.4).
+- The frontier and lock tables are **not** derivable from the wiki and are backed up nightly (section 5.4). Goals, snapshots, and evaluations are also not derivable from Markdown. The v4 bundle in section 5.5 is what preserves them with the raw bytes and human edits. Human-edited wiki regions stay labelled `human_note` and are not source evidence.
 
 The v0 npm `llm-wiki-compiler` is retired at M2 and replaced by `snowball/compiler.py`.
 
@@ -1608,7 +1743,7 @@ Current defect, recorded as regressions `digest-eval-zero-over-zero` and `digest
 
 ### 8.7 `snowball ask`
 
-`snowball ask "<question>"`: FTS5 `MATCH` over `wiki_fts` (query sanitised: quotes balanced, operators escaped, hyperresearch PR #52), top 12 by `bm25(wiki_fts)`, page bodies filtered with section 7.3 to 25 chunks, one Qwen 27B call with the instruction to answer only from the chunks and cite `[path]` after each sentence. Sentences without a citation are dropped by code. Target under 30 s.
+`snowball ask "<question>"`: FTS5 `MATCH` over `wiki_fts` (query sanitised: quotes balanced, operators escaped, hyperresearch PR #52), top 12 by `bm25(wiki_fts)`, page bodies filtered with section 7.3 to 25 chunks. The historical design named one Qwen 27B call. The current command retrieves those chunks and, unless `--no-model` is set, calls `LocalPrivateEngine.interpret(prompt, max_out=1024)` on an attested local daemon. That method is not defined yet, so ask returns `private_engine_unavailable` instead of using AGY, Gemini, or a retrieval downgrade. Sentences without a citation are dropped by code. This is not a periodic Gemini hook.
 
 ### 8.8 Retention
 
@@ -1616,10 +1751,10 @@ Current defect, recorded as regressions `digest-eval-zero-over-zero` and `digest
 |---|---|
 | `raw/` | delete files older than 14 days; quarantined pages kept 30 days |
 | `logs/` | 30 days |
-| `data/backup/` | 7 nightly copies |
+| `data/backup/` | current v4 bundle; surplus historical `snowball-*.db` files pruned to 7 |
 | `wiki/`, `data/snowball.db`, `digests/` | forever |
 
-`snowball-retention.timer` also runs `VACUUM INTO`, the deadline-expiry job and `PRAGMA quick_check` weekly.
+`snowball-retention.timer` runs retention. That writes the section 5.5 bundle and does not write a new dated `VACUUM INTO` `snowball-YYYY-MM-DD.db`. Deadline expiry and `PRAGMA quick_check` stay on that path. Surplus existing `snowball-*.db` files are deleted down to 7.
 
 ---
 
@@ -1789,6 +1924,25 @@ The hour estimate above is about 44 hours of agent time across M1–M4. Each mil
 | `DISK_MIN_FREE_GB` | 5 | |
 | `EMBEDDINGS_URL` | empty | optional; must pass the M3 topic benchmark before use |
 
+`LLM_TOKENS_PER_DAY` 2000000 in the table above is the historical lead-crawler design default. A 32,000,000 figure in older local configuration is also historical. Oracle estimated ceilings are in the README (800000 total, 600000 extract, 200000 review) and are not a hard provider-token cap.
+
+Harness keys. Put them in the environment file you pass as `SNOWBALL_ENV_FILE`. On Oracle that file is `config.oracle.env`. They are not activated by this document.
+
+| Key | Value | Meaning |
+|---|---|---|
+| `GEMINI_MODEL` | `agy-pool/gemini-3.8-flash` on Oracle | Extract model id |
+| `GEMINI_TRANSPORT` | `omp` on Oracle | Extract transport through the AGY proxy |
+| `REVIEW_MODEL` | `agy-pool/claude-sonnet-4-6` on Oracle | Review and plan model id |
+| `PLAN_TOKENS_PER_WAVE` | unset until you accept it | Per-wave plan accounting. Design recommendation 8000. Estimated, and it consumes the shared total. |
+| `PRIVATE_MODEL_ENDPOINT` | unset | `private_model_endpoint`. Set only after you attest an isolated daemon. Loopback is not that attestation. |
+| `PRIVATE_MODEL_ID` | unset | `private_model_id`. Leave unset until isolation is attested. |
+| `PRIVATE_MODEL_ATTESTED` | unset | `private_model_attested`. Only boolean true counts. |
+| `PRIVATE_MODEL_ISOLATION` | unset | `private_model_isolation`. 20–500 characters naming egress or isolation. |
+| `CONSOLE_ALLOWED_ORIGINS` | `https://snowball.ishannaik.com` on Oracle | Browser Origin allowlist. Independent of Caddy's Host rewrite. |
+| `CONSOLE_COOKIE_SECURE` | `1` behind that HTTPS origin | `Secure` flag on the session cookie |
+
+`REVIEW_*` and `PLAN_*` are the review and plan settings. `GROK_X_*` stays for public X acquisition only. The SSH host key is `SSH_MODEL_HOST` only. Removed names are not aliases: `PRIVATE_MODEL`, `GROK_VERIFIER_MODEL`, `GROK_TOKENS_PER_DAY`, `GEMINI_SSH_HOST`, and `INDIA_ELIGIBILITY_CHECK`.
+
 `.env` (secrets, never committed): `QWEN_API_KEY` (required for model calls), `GH_TOKEN` (optional), `ZENROWS_API_KEY`, `RESIDENTIAL_PROXY_URL`, and `CAPTCHA_API_KEY` (optional; each is inert while ceilings are zero or `access.yml` lacks that origin). The Discord bot token is read from the bridge's own env file path, never copied. Never log API-key query parameters, proxy credentials, challenge tokens, or cookies.
 
 `topics.yml`: `families` with `recheck_days`, `weight`, `relevance_floor`, `focus`; `seeds` with `id`, `family`, `focus`, optional `regions`, `audiences`. The seeder expands `family x region x audience x source x window` into `queries` with `discovered_via='seed'`.
@@ -1797,9 +1951,11 @@ The hour estimate above is about 44 hours of agent time across M1–M4. Each mil
 
 | Command | Does |
 |---|---|
-| `snowball seed [--dry-run]` | expand `topics.yml` into the seed grid; idempotent |
-| `snowball run-once` | one wave, then exit (used by tests) |
-| `snowball status` | frontier size by status, fetches/day by route, new/changed entities/day, repeat rate, budgets left, paid fetches used, dry cuts, memory |
+| `snowball seed [--topics FILE] [--dry-run or --dryrun] [--db PATH] [--json]` | Expand the topic file into the seed grid. Does not accept `--topic`, `--max-topics`, or `--mode`. Does not by itself authorize a wave. |
+| `snowball run [--topic SLUG] [--max-topics N] [--mode auto or gemini-bulk] [--topics FILE] [--dry-run or --dryrun] [--db PATH] [--json]` | One batch. `--topic` is a slug. |
+| `snowball run-once` (same flags as `run`) | One wave, then exit. |
+| `snowball supervise` (same flags as `run`) | Persistent loop. `--supervise` forwards `--max-topics` and `--topic` as `slug_filter`. `interval_sec` stays 60. There is no `--interval` flag and no `stop_file` argument on that call. |
+| `snowball status [--db PATH] [--json]` | Read-only frontier and harness status. Does not take `--topic`, `--topics`, `--dry-run`, `--max-topics`, or `--mode`. |
 | `snowball ask "<q>"` | library answer with citations |
 | `snowball digest [--date]` | build and (if configured) post the digest |
 | `snowball compile [--full]` | incremental compile, or full rebuild of `wiki/` from the DB |
@@ -1807,6 +1963,12 @@ The hour estimate above is about 44 hours of agent time across M1–M4. Each mil
 | `snowball retention` | prune raw/logs, backup, expire deadlines, quick_check |
 | `snowball eval classify\|extract\|digest …` | evaluator commands. Current classify, extract, and digest implementations are not production-gate proofs. See section 9.1. Owners T5 and T10. |
 | `python tools/eval_gates.py evidence-check` | validate `data/gate-evidence.jsonl`. A successful check reports row counts. It does not run gates and it does not mark them verified. |
+| `snowball migrate --db PATH --bundle-root DIR` | Explicit v4 upgrade. Writes the corpus bundle first. `status` and `serve` do not migrate. |
+| `snowball goal new\|show\|interview\|propose\|diff\|approve\|grant\|start\|pause\|resume\|stop\|revise\|cancel-revision\|replan\|adopt-topics` | Local goal control. `propose` requires `--from-fields`. `approve` requires `--version` and `--hash`. `grant` requires `--contract`, `--limits`, and `--expires`. `grant` does not start acquisition. |
+| `snowball console token --ttl 900 --db PATH` | Prints a one-use bootstrap token. Exec target is `tools/console.py`. |
+| `snowball serve --host 127.0.0.1 --port 8989 --db PATH` | `snowball.py` execs `tools/console.py` with `--db`, `--host`, and `--port`. `visualize` is the terminal view. |
+| `snowball run-once --dry-run` | In-memory copy, no external calls, goal gate included. |
+| `snowball status --json --db PATH` | Read-only. Adds goal, grant, headroom, substate, and role availability when the harness status fields are present. Does not take `--topic`. |
 
 ## Appendix C: constants table
 
